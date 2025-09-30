@@ -5,11 +5,14 @@ Detects all types of links including dynamic/JavaScript-rendered content
 Stores comprehensive metadata in SQLite database
 """
 
+import argparse
 import sqlite3
 import requests
 from urllib.parse import urljoin, urlparse, urlunparse, parse_qs, urlencode
+from urllib.robotparser import RobotFileParser
 from bs4 import BeautifulSoup
 import re
+import xml.etree.ElementTree as ET
 import json
 import hashlib
 from datetime import datetime
@@ -18,6 +21,8 @@ import time
 import logging
 from typing import Set, Dict, List, Optional
 from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -321,6 +326,19 @@ class DatabaseManager:
             LIMIT 1
         """)
         return cursor.fetchone()
+
+    def get_distinct_domains(self) -> List[str]:
+        """Get a list of distinct domains from the pages table"""
+        cursor = self.connection.cursor()
+        cursor.execute("SELECT DISTINCT domain FROM pages WHERE domain IS NOT NULL ORDER BY domain")
+        return [row[0] for row in cursor.fetchall()]
+
+    def reset_domain_crawl_status(self, domain: str):
+        """Reset the crawl status for a specific domain."""
+        cursor = self.connection.cursor()
+        cursor.execute("UPDATE pages SET is_crawled = 0 WHERE domain = ?", (domain,))
+        self.connection.commit()
+        logger.info(f"Crawl status reset for domain: {domain}")
     
     def close(self):
         """Close database connection"""
@@ -524,17 +542,78 @@ class WebCrawler:
         
         self.db = DatabaseManager()
         self.link_detector = LinkDetector(start_url)
+        self.user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (AdvancedCrawler/1.0)'
+        self.robot_parsers = {}
         
         # Request session
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            'User-Agent': self.user_agent
         })
         
         # Selenium setup
         self.driver = None
         if use_selenium:
             self.setup_selenium()
+
+    def parse_sitemap(self, domain: str):
+        """Finds, fetches, and parses the sitemap(s) for a domain."""
+        robot_parser = self.get_robot_parser(domain)
+        sitemap_urls = []
+        if robot_parser and robot_parser.sitemaps:
+            sitemap_urls.extend(robot_parser.sitemaps)
+        else:
+            # Fallback to default location
+            sitemap_urls.append(urlunparse(('https', domain, '/sitemap.xml', '', '', '')))
+
+        for sitemap_url in sitemap_urls:
+            try:
+                response = self.session.get(sitemap_url, timeout=15)
+                if response.status_code == 200:
+                    logger.info(f"Parsing sitemap: {sitemap_url}")
+                    self.extract_urls_from_sitemap(response.content)
+            except Exception as e:
+                logger.warning(f"Could not fetch or parse sitemap {sitemap_url}: {e}")
+
+    def extract_urls_from_sitemap(self, sitemap_content: bytes):
+        """Extracts URLs from sitemap XML content."""
+        try:
+            root = ET.fromstring(sitemap_content)
+            # XML namespace is often present and needs to be handled
+            namespace = {'ns': root.tag.split('}')[0][1:]} if '}' in root.tag else {'ns': ''}
+
+            # Find all <loc> tags, which contain the URLs
+            urls = [
+                loc.text.strip()
+                for loc in root.findall('.//ns:loc', namespaces=namespace)
+            ]
+
+            for url in urls:
+                if self.link_detector.is_internal(url):
+                    self.db.add_page(url, parent_url='sitemap', depth=0)
+
+            logger.info(f"Added {len(urls)} URLs from sitemap to the queue.")
+
+        except ET.ParseError as e:
+            logger.error(f"Failed to parse sitemap XML: {e}")
+
+    def get_robot_parser(self, domain: str) -> Optional[RobotFileParser]:
+        """Fetches, parses, and caches the robots.txt file for a domain."""
+        if domain in self.robot_parsers:
+            return self.robot_parsers[domain]
+
+        robots_url = urlunparse(('https', domain, '/robots.txt', '', '', ''))
+        parser = RobotFileParser()
+        parser.set_url(robots_url)
+        try:
+            parser.read()
+            self.robot_parsers[domain] = parser
+            logger.info(f"Successfully parsed robots.txt for {domain}")
+            return parser
+        except Exception as e:
+            logger.warning(f"Could not fetch or parse robots.txt for {domain}: {e}")
+            self.robot_parsers[domain] = None # Cache failure to avoid retries
+            return None
     
     def setup_selenium(self):
         """Setup Selenium WebDriver"""
@@ -544,9 +623,10 @@ class WebCrawler:
             chrome_options.add_argument('--no-sandbox')
             chrome_options.add_argument('--disable-dev-shm-usage')
             chrome_options.add_argument('--disable-gpu')
-            chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
+            chrome_options.add_argument(f'--user-agent={self.user_agent}')
             
-            self.driver = webdriver.Chrome(options=chrome_options)
+            service = Service(ChromeDriverManager().install())
+            self.driver = webdriver.Chrome(service=service, options=chrome_options)
             logger.info("Selenium WebDriver initialized")
         except Exception as e:
             logger.warning(f"Could not initialize Selenium: {e}")
@@ -742,8 +822,10 @@ class WebCrawler:
         """Start crawling process"""
         logger.info(f"Starting crawler from: {self.start_url}")
         
-        # Add start URL
-        start_page_id = self.db.add_page(self.start_url, depth=0)
+        # Add start URL and parse sitemap
+        domain = urlparse(self.start_url).netloc
+        self.db.add_page(self.start_url, depth=0)
+        self.parse_sitemap(domain)
         
         # Crawl loop
         while True:
@@ -754,6 +836,17 @@ class WebCrawler:
                 break
             
             page_id, url, depth = next_page
+
+            # Check robots.txt before crawling
+            domain = urlparse(url).netloc
+            robot_parser = self.get_robot_parser(domain)
+            if robot_parser and not robot_parser.can_fetch(self.user_agent, url):
+                logger.info(f"Skipping (disallowed by robots.txt): {url}")
+                self.db.update_page_crawl(page_id, {
+                    'status_code': 403,  # Use a specific code for disallowed
+                    'error_message': 'Disallowed by robots.txt'
+                })
+                continue
             
             if depth > self.max_depth:
                 logger.info(f"Max depth reached, skipping: {url}")
@@ -773,41 +866,68 @@ class WebCrawler:
 
 def main():
     """Main entry point"""
-    import sys
+    parser = argparse.ArgumentParser(description="Advanced Web Crawler")
+    parser.add_argument("start_url", nargs='?', default=None, help="The URL to start crawling from.")
+    parser.add_argument("-d", "--max-depth", type=int, default=3, help="Maximum crawl depth.")
+    parser.add_argument("-w", "--delay", type=float, default=1.0, help="Delay between requests in seconds.")
+    parser.add_argument("-s", "--use-selenium", action='store_true', help="Use Selenium for dynamic content.")
+    parser.add_argument("-u", "--update", action='store_true', help="Update an existing domain from the database.")
     
-    if len(sys.argv) < 2:
-        print("Usage: python crawler.py <start_url> [max_depth] [delay] [use_selenium]")
-        print("Example: python crawler.py https://example.com 2 1.0 true")
-        sys.exit(1)
+    args = parser.parse_args()
     
-    start_url = sys.argv[1]
-    
-    # Parse optional arguments
-    max_depth = 3
-    if len(sys.argv) > 2:
-        try:
-            max_depth = int(sys.argv[2])
-        except ValueError:
-            logger.warning(f"Invalid max_depth '{sys.argv[2]}'. Using default {max_depth}.")
+    start_url = args.start_url
 
-    delay = 1.0
-    if len(sys.argv) > 3:
+    if args.update:
+        db_manager = DatabaseManager()
         try:
-            delay = float(sys.argv[3])
-        except ValueError:
-            logger.warning(f"Invalid delay '{sys.argv[3]}'. Using default {delay}.")
+            domains = db_manager.get_distinct_domains()
+            if not domains:
+                print("No domains found in the database to update.")
+                return
 
-    use_selenium = True
-    if len(sys.argv) > 4:
-        use_selenium = sys.argv[4].lower() in ['true', '1', 't', 'y']
+            print("Please choose a domain to update:")
+            for i, domain in enumerate(domains):
+                print(f"{i + 1}: {domain}")
+
+            choice_str = input("Enter the number of the domain: ")
+            choice = int(choice_str) - 1
+            if 0 <= choice < len(domains):
+                selected_domain = domains[choice]
+                print(f"Preparing to update domain: {selected_domain}")
+                db_manager.reset_domain_crawl_status(selected_domain)
+                cursor = db_manager.connection.cursor()
+                cursor.execute("SELECT url FROM pages WHERE domain = ? ORDER BY discovered_at ASC LIMIT 1", (selected_domain,))
+                result = cursor.fetchone()
+                if result:
+                    start_url = result[0]
+                    print(f"Starting update from URL: {start_url}")
+                else:
+                    print(f"Could not find a starting URL for domain {selected_domain}.")
+                    return
+            else:
+                print("Invalid choice.")
+                return
+        except (ValueError, IndexError):
+            print("Invalid input.")
+            return
+        finally:
+            db_manager.close()
+
+    if not start_url:
+        parser.error("A start_url is required, either as an argument or by selecting a domain with --update.")
 
     crawler = WebCrawler(
         start_url=start_url,
-        max_depth=max_depth,
-        delay=delay,
-        use_selenium=use_selenium
+        max_depth=args.max_depth,
+        delay=args.delay,
+        use_selenium=args.use_selenium
     )
-    crawler.start()
+
+    try:
+        crawler.start()
+    except Exception as e:
+        logger.error(f"An unexpected error occurred during crawling: {e}")
+        crawler.cleanup()
 
 
 if __name__ == "__main__":
