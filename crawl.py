@@ -317,16 +317,22 @@ class DatabaseManager:
         ))
         self.connection.commit()
     
-    def get_next_uncrawled(self) -> Optional[tuple]:
-        """Get next uncrawled page"""
+    def get_next_uncrawled(self, domain: Optional[str] = None) -> Optional[tuple]:
+        """Get next uncrawled page, optionally for a specific domain."""
         cursor = self.connection.cursor()
-        cursor.execute("""
+        query = """
             SELECT id, url, crawl_depth 
             FROM pages 
             WHERE is_crawled = 0 
-            ORDER BY crawl_depth ASC, discovered_at ASC 
-            LIMIT 1
-        """)
+        """
+        params = []
+        if domain:
+            query += " AND domain = ?"
+            params.append(domain)
+
+        query += " ORDER BY crawl_depth ASC, discovered_at ASC LIMIT 1"
+
+        cursor.execute(query, params)
         return cursor.fetchone()
 
     def get_distinct_domains(self) -> List[str]:
@@ -334,6 +340,51 @@ class DatabaseManager:
         cursor = self.connection.cursor()
         cursor.execute("SELECT DISTINCT domain FROM pages WHERE domain IS NOT NULL ORDER BY domain")
         return [row[0] for row in cursor.fetchall()]
+
+    def get_total_pages_count(self, domain: Optional[str] = None) -> int:
+        """Returns the total number of pages, optionally for a specific domain."""
+        cursor = self.connection.cursor()
+        query = "SELECT COUNT(id) FROM pages"
+        params = []
+        if domain:
+            query += " WHERE domain = ?"
+            params.append(domain)
+        cursor.execute(query, params)
+        return cursor.fetchone()[0]
+
+    def get_crawled_pages_count(self, domain: Optional[str] = None) -> int:
+        """Returns the number of crawled pages, optionally for a specific domain."""
+        cursor = self.connection.cursor()
+        query = "SELECT COUNT(id) FROM pages WHERE is_crawled = 1"
+        params = []
+        if domain:
+            query += " AND domain = ?"
+            params.append(domain)
+        cursor.execute(query, params)
+        return cursor.fetchone()[0]
+
+    def get_uncrawled_pages_count(self, domain: Optional[str] = None) -> int:
+        """Returns the number of uncrawled pages, optionally for a specific domain."""
+        cursor = self.connection.cursor()
+        query = "SELECT COUNT(id) FROM pages WHERE is_crawled = 0"
+        params = []
+        if domain:
+            query += " AND domain = ?"
+            params.append(domain)
+        cursor.execute(query, params)
+        return cursor.fetchone()[0]
+
+    def delete_domain_data(self, domain: str):
+        """Deletes all data associated with a specific domain."""
+        cursor = self.connection.cursor()
+        # First, delete from child tables (links, resources, etc.)
+        cursor.execute("DELETE FROM links WHERE source_page_id IN (SELECT id FROM pages WHERE domain = ?)", (domain,))
+        cursor.execute("DELETE FROM javascript_events WHERE page_id IN (SELECT id FROM pages WHERE domain = ?)", (domain,))
+        cursor.execute("DELETE FROM resources WHERE page_id IN (SELECT id FROM pages WHERE domain = ?)", (domain,))
+        # Finally, delete from the pages table
+        cursor.execute("DELETE FROM pages WHERE domain = ?", (domain,))
+        self.connection.commit()
+        logger.info(f"All data for domain '{domain}' has been deleted.")
 
     def reset_domain_crawl_status(self, domain: str):
         """Reset the crawl status for a specific domain."""
@@ -534,30 +585,49 @@ class LinkDetector:
 
 class WebCrawler:
     """Main crawler class"""
-    
-    def __init__(self, start_url: str, max_depth: int = 3, 
+
+    def __init__(self, db_manager: DatabaseManager, start_url: Optional[str] = None,
+                 domain_to_crawl: Optional[str] = None, max_depth: int = 3,
                  delay: float = 1.0, use_selenium: bool = True, disregard_robots: bool = False):
+        self.db = db_manager
         self.start_url = start_url
+        self.domain_to_crawl = domain_to_crawl
         self.max_depth = max_depth
         self.delay = delay
         self.use_selenium = use_selenium
         self.disregard_robots = disregard_robots
         
-        self.db = DatabaseManager()
-        self.link_detector = LinkDetector(start_url)
+        if start_url:
+            base_for_detector = start_url
+        elif domain_to_crawl:
+            base_for_detector = f"http://{domain_to_crawl}"
+        else:
+            raise ValueError("WebCrawler requires either a start_url or a domain_to_crawl.")
+
+        self.link_detector = LinkDetector(base_for_detector)
         self.user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (AdvancedCrawler/1.0)'
         self.robot_parsers = {}
         
-        # Request session
         self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': self.user_agent
-        })
+        self.session.headers.update({'User-Agent': self.user_agent})
         
-        # Selenium setup
         self.driver = None
         if use_selenium:
             self.setup_selenium()
+
+    def print_initial_summary(self):
+        """Prints a summary of the current database state."""
+        total_pages = self.db.get_total_pages_count()
+        crawled_pages = self.db.get_crawled_pages_count()
+        uncrawled_pages = self.db.get_uncrawled_pages_count()
+        domains = len(self.db.get_distinct_domains())
+
+        print("\n--- Database Initial State ---")
+        print(f"Total domains: {domains}")
+        print(f"Total pages discovered: {total_pages}")
+        print(f"Pages crawled: {crawled_pages}")
+        print(f"Pages pending crawl: {uncrawled_pages}")
+        print("------------------------------\n")
 
     def parse_sitemap(self, domain: str):
         """Finds, fetches, and parses the sitemap(s) for a domain."""
@@ -566,7 +636,6 @@ class WebCrawler:
         if robot_parser and robot_parser.sitemaps:
             sitemap_urls.extend(robot_parser.sitemaps)
         else:
-            # Fallback to default location
             sitemap_urls.append(urlunparse(('https', domain, '/sitemap.xml', '', '', '')))
 
         for sitemap_url in sitemap_urls:
@@ -582,21 +651,12 @@ class WebCrawler:
         """Extracts URLs from sitemap XML content."""
         try:
             root = ET.fromstring(sitemap_content)
-            # XML namespace is often present and needs to be handled
             namespace = {'ns': root.tag.split('}')[0][1:]} if '}' in root.tag else {'ns': ''}
-
-            # Find all <loc> tags, which contain the URLs
-            urls = [
-                loc.text.strip()
-                for loc in root.findall('.//ns:loc', namespaces=namespace)
-            ]
-
+            urls = [loc.text.strip() for loc in root.findall('.//ns:loc', namespaces=namespace)]
             for url in urls:
                 if self.link_detector.is_internal(url):
                     self.db.add_page(url, parent_url='sitemap', depth=0)
-
             logger.info(f"Added {len(urls)} URLs from sitemap to the queue.")
-
         except ET.ParseError as e:
             logger.error(f"Failed to parse sitemap XML: {e}")
 
@@ -604,7 +664,6 @@ class WebCrawler:
         """Fetches, parses, and caches the robots.txt file for a domain."""
         if domain in self.robot_parsers:
             return self.robot_parsers[domain]
-
         robots_url = urlunparse(('https', domain, '/robots.txt', '', '', ''))
         parser = RobotFileParser()
         parser.set_url(robots_url)
@@ -615,7 +674,7 @@ class WebCrawler:
             return parser
         except Exception as e:
             logger.warning(f"Could not fetch or parse robots.txt for {domain}: {e}")
-            self.robot_parsers[domain] = None # Cache failure to avoid retries
+            self.robot_parsers[domain] = None
             return None
     
     def setup_selenium(self):
@@ -628,7 +687,6 @@ class WebCrawler:
             chrome_options.add_argument('--disable-gpu')
             chrome_options.add_argument(f'--user-agent={self.user_agent}')
             
-            # Check for local chromedriver
             driver_name = "chromedriver.exe" if platform.system() == "Windows" else "chromedriver"
             local_driver_path = os.path.abspath(driver_name)
 
@@ -669,58 +727,37 @@ class WebCrawler:
                 
                 # Extract metadata
                 page_data['title'] = soup.title.string if soup.title else None
-                
                 meta_desc = soup.find('meta', attrs={'name': 'description'})
                 page_data['meta_description'] = meta_desc['content'] if meta_desc else None
-                
                 meta_keywords = soup.find('meta', attrs={'name': 'keywords'})
                 page_data['meta_keywords'] = meta_keywords['content'] if meta_keywords else None
-                
                 canonical = soup.find('link', attrs={'rel': 'canonical'})
                 page_data['canonical_url'] = canonical['href'] if canonical else None
-                
                 robots = soup.find('meta', attrs={'name': 'robots'})
                 page_data['robots_meta'] = robots['content'] if robots else None
-                
-                # Open Graph
                 og_title = soup.find('meta', property='og:title')
                 page_data['og_title'] = og_title['content'] if og_title else None
-                
                 og_desc = soup.find('meta', property='og:description')
                 page_data['og_description'] = og_desc['content'] if og_desc else None
-                
                 og_img = soup.find('meta', property='og:image')
                 page_data['og_image'] = og_img['content'] if og_img else None
-                
                 og_type = soup.find('meta', property='og:type')
                 page_data['og_type'] = og_type['content'] if og_type else None
-                
-                # Twitter Card
                 tw_card = soup.find('meta', attrs={'name': 'twitter:card'})
                 page_data['twitter_card'] = tw_card['content'] if tw_card else None
-                
                 lang = soup.find('html')
                 page_data['language'] = lang.get('lang') if lang else None
                 
-                # Extract links
-                static_links = self.link_detector.extract_static_links(soup, url)
-                js_links = self.link_detector.extract_javascript_links(soup, url)
+                all_links = self.link_detector.extract_static_links(soup, url) + \
+                            self.link_detector.extract_javascript_links(soup, url)
                 
-                all_links = static_links + js_links
-                
-                # Store links
                 for link in all_links:
                     self.db.add_link(page_id, link)
-                    
-                    # Add to crawl queue if internal and within depth
                     if link['is_internal'] and depth < self.max_depth:
-                        new_page_id = self.db.add_page(
-                            link['target_url'], 
-                            parent_url=url, 
-                            depth=depth + 1
-                        )
+                        self.db.add_page(link['target_url'], parent_url=url, depth=depth + 1)
                 
-                logger.info(f"Found {len(all_links)} links on {url}")
+                # Use logger for consistency, not print
+                logger.debug(f"Found {len(all_links)} links on {url}")
         
         except Exception as e:
             logger.error(f"Error crawling {url}: {e}")
@@ -732,134 +769,103 @@ class WebCrawler:
         """Crawl page using Selenium for dynamic content"""
         page_data = {}
         start_time = time.time()
-        
         try:
             self.driver.get(url)
-            
-            # Wait for page load
-            WebDriverWait(self.driver, 10).until(
-                EC.presence_of_element_located((By.TAG_NAME, "body"))
-            )
-            
-            # Additional wait for JS to execute
+            WebDriverWait(self.driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
             time.sleep(2)
             
-            response_time = int((time.time() - start_time) * 1000)
-            page_data['response_time_ms'] = response_time
-            
-            # Get page source after JS execution
+            page_data['response_time_ms'] = int((time.time() - start_time) * 1000)
             page_source = self.driver.page_source
             soup = BeautifulSoup(page_source, 'html.parser')
             
-            # Extract metadata (same as static)
             page_data['title'] = self.driver.title
-            page_data['status_code'] = 200  # Selenium doesn't provide status code easily
+            page_data['status_code'] = 200
             
-            # Extract links from rendered page
             static_links = self.link_detector.extract_static_links(soup, url)
             js_links = self.link_detector.extract_javascript_links(soup, url)
-            
-            # Extract dynamic links using Selenium
             dynamic_links = []
-            clickable_elements = self.driver.find_elements(By.XPATH, 
-                "//*[@onclick or @href or contains(@class, 'link') or contains(@class, 'btn')]")
             
-            for idx, element in enumerate(clickable_elements[:100]):  # Limit to avoid overload
+            clickable_elements = self.driver.find_elements(By.XPATH, "//*[@onclick or @href or contains(@class, 'link') or contains(@class, 'btn')]")
+            for idx, element in enumerate(clickable_elements[:100]):
                 try:
                     href = element.get_attribute('href')
                     onclick = element.get_attribute('onclick')
-                    text = element.text[:500]
-                    
                     detected_url = None
                     if href:
                         detected_url = self.link_detector.normalize_url(href, url)
                     elif onclick:
                         urls = self.link_detector.extract_urls_from_js(onclick, url)
                         detected_url = urls[0] if urls else None
-                    
                     if detected_url:
                         dynamic_links.append({
-                            'target_url': detected_url,
-                            'text': text,
-                            'type': 'dynamic',
-                            'is_internal': self.link_detector.is_internal(detected_url),
-                            'is_follow': True,
-                            'is_external': not self.link_detector.is_internal(detected_url),
-                            'position': idx,
-                            'detected_method': 'selenium',
-                            'is_javascript': bool(onclick),
-                            'is_dynamic': True,
-                            'onclick': onclick
+                            'target_url': detected_url, 'text': element.text[:500], 'type': 'dynamic',
+                            'is_internal': self.link_detector.is_internal(detected_url), 'is_follow': True,
+                            'is_external': not self.link_detector.is_internal(detected_url), 'position': idx,
+                            'detected_method': 'selenium', 'is_javascript': bool(onclick),
+                            'is_dynamic': True, 'onclick': onclick
                         })
-                except:
+                except Exception:
                     continue
             
             all_links = static_links + js_links + dynamic_links
-            
-            # Store links and queue new pages
             for link in all_links:
                 self.db.add_link(page_id, link)
-                
                 if link['is_internal'] and depth < self.max_depth:
-                    self.db.add_page(
-                        link['target_url'], 
-                        parent_url=url, 
-                        depth=depth + 1
-                    )
+                    self.db.add_page(link['target_url'], parent_url=url, depth=depth + 1)
             
-            logger.info(f"Found {len(all_links)} links (including {len(dynamic_links)} dynamic) on {url}")
-        
+            logger.debug(f"Found {len(all_links)} links (including {len(dynamic_links)} dynamic) on {url}")
         except Exception as e:
             logger.error(f"Error with Selenium on {url}: {e}")
             page_data['error_message'] = str(e)
-        
         return page_data
     
     def crawl_page(self, url: str, page_id: int, depth: int):
         """Crawl a single page"""
-        logger.info(f"Crawling: {url} (depth: {depth})")
+        logger.debug(f"Crawling: {url} (depth: {depth})")
         
-        # Try Selenium first for dynamic content, fallback to requests
-        if self.use_selenium and self.driver:
-            page_data = self.crawl_page_selenium(url, page_id, depth)
-        else:
-            page_data = self.crawl_page_static(url, page_id, depth)
+        page_data = self.crawl_page_selenium(url, page_id, depth) if self.use_selenium and self.driver \
+                    else self.crawl_page_static(url, page_id, depth)
         
-        # Update database
         self.db.update_page_crawl(page_id, page_data)
-        
-        # Respect crawl delay
         time.sleep(self.delay)
     
     def start(self):
         """Start crawling process"""
-        logger.info(f"Starting crawler from: {self.start_url}")
+        logger.info("Starting crawler...")
+
+        if self.start_url:
+            domain = urlparse(self.start_url).netloc
+            self.db.add_page(self.start_url, depth=0)
+            self.parse_sitemap(domain)
         
-        # Add start URL and parse sitemap
-        domain = urlparse(self.start_url).netloc
-        self.db.add_page(self.start_url, depth=0)
-        self.parse_sitemap(domain)
+        self.print_initial_summary()
+        session_crawled_count = 0
+        task_total_initial = self.db.get_uncrawled_pages_count(self.domain_to_crawl)
+
+        if self.domain_to_crawl:
+            logger.info(f"Task: Crawl/update domain '{self.domain_to_crawl}'. Pages to process: {task_total_initial}")
+        else:
+            logger.info(f"Task: Continue crawl. Pages to process: {task_total_initial}")
         
-        # Crawl loop
         while True:
-            next_page = self.db.get_next_uncrawled()
-            
+            next_page = self.db.get_next_uncrawled(self.domain_to_crawl)
             if not next_page:
-                logger.info("No more pages to crawl")
+                if session_crawled_count == 0:
+                    logger.info("No pages to crawl for the selected task.")
+                else:
+                    # Newline after progress bar
+                    print()
+                    logger.info(f"Crawl session complete. Crawled {session_crawled_count} pages.")
                 break
             
             page_id, url, depth = next_page
 
-            # Check robots.txt before crawling
             if not self.disregard_robots:
                 domain = urlparse(url).netloc
                 robot_parser = self.get_robot_parser(domain)
                 if robot_parser and not robot_parser.can_fetch(self.user_agent, url):
-                    logger.info(f"Skipping (disallowed by robots.txt): {url}")
-                    self.db.update_page_crawl(page_id, {
-                        'status_code': 403,  # Use a specific code for disallowed
-                        'error_message': 'Disallowed by robots.txt'
-                    })
+                    logger.warning(f"Skipping (disallowed by robots.txt): {url}")
+                    self.db.update_page_crawl(page_id, {'status_code': 403, 'error_message': 'Disallowed by robots.txt'})
                     continue
             
             if depth > self.max_depth:
@@ -867,34 +873,73 @@ class WebCrawler:
                 continue
             
             self.crawl_page(url, page_id, depth)
+            session_crawled_count += 1
+
+            uncrawled_in_task = self.db.get_uncrawled_pages_count(self.domain_to_crawl)
+            total_uncrawled_db = self.db.get_uncrawled_pages_count()
+            progress_percent = (session_crawled_count / task_total_initial) * 100 if task_total_initial > 0 else 100
+
+            # On-the-fly progress reporting to the console
+            print(
+                f"\rProgress: {min(progress_percent, 100):.2f}% | "
+                f"Session: {session_crawled_count} crawled | "
+                f"Task Queue: {uncrawled_in_task} left | "
+                f"DB Queue: {total_uncrawled_db} total left",
+                end="", flush=True
+            )
         
-        logger.info("Crawling complete!")
-        self.cleanup()
+        logger.info("Crawler has finished its task.")
     
     def cleanup(self):
         """Cleanup resources"""
         if self.driver:
             self.driver.quit()
-        self.db.close()
 
 
 def main():
     """Main entry point"""
-    parser = argparse.ArgumentParser(description="Advanced Web Crawler")
-    parser.add_argument("start_url", nargs='?', default=None, help="The URL to start crawling from.")
-    parser.add_argument("-d", "--max-depth", type=int, default=3, help="Maximum crawl depth.")
-    parser.add_argument("-w", "--delay", type=float, default=1.0, help="Delay between requests in seconds.")
+    parser = argparse.ArgumentParser(
+        description="Advanced Web Crawler with different modes of operation.",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+
+    mode_group = parser.add_mutually_exclusive_group(required=True)
+    mode_group.add_argument("--new-scan", metavar="URL", help="Start a new scan from a URL. Deletes old data for the domain if it exists.")
+    mode_group.add_argument("--update", action="store_true", help="Update an existing domain by re-crawling all its pages.")
+    mode_group.add_argument("--continue-crawl", action="store_true", help="Continue the last crawl, processing any remaining uncrawled links.")
+
+    parser.add_argument("-d", "--max-depth", type=int, default=3, help="Maximum crawl depth. Default: 3")
+    parser.add_argument("-w", "--delay", type=float, default=1.0, help="Delay between requests in seconds. Default: 1.0")
     parser.add_argument("-s", "--use-selenium", action='store_true', help="Use Selenium for dynamic content.")
-    parser.add_argument("-u", "--update", action='store_true', help="Update an existing domain from the database.")
-    parser.add_argument("--disregard-robots", action='store_true', help="Disregard robots.txt and its rule settings.")
+    parser.add_argument("--disregard-robots", action='store_true', help="Disregard robots.txt rules.")
     
     args = parser.parse_args()
-    
-    start_url = args.start_url
+    db_manager = DatabaseManager()
+    crawler = None
 
-    if args.update:
-        db_manager = DatabaseManager()
-        try:
+    try:
+        if args.new_scan:
+            start_url = args.new_scan
+            domain = urlparse(start_url).netloc
+            if db_manager.get_total_pages_count(domain) > 0:
+                choice = input(f"Data for domain '{domain}' already exists. Delete it and start a fresh scan? (y/n): ").lower()
+                if choice == 'y':
+                    db_manager.delete_domain_data(domain)
+                else:
+                    print("Aborting scan.")
+                    return
+
+            crawler = WebCrawler(
+                db_manager=db_manager,
+                start_url=start_url,
+                domain_to_crawl=domain,
+                max_depth=args.max_depth,
+                delay=args.delay,
+                use_selenium=args.use_selenium,
+                disregard_robots=args.disregard_robots
+            )
+
+        elif args.update:
             domains = db_manager.get_distinct_domains()
             if not domains:
                 print("No domains found in the database to update.")
@@ -904,46 +949,49 @@ def main():
             for i, domain in enumerate(domains):
                 print(f"{i + 1}: {domain}")
 
-            choice_str = input("Enter the number of the domain: ")
-            choice = int(choice_str) - 1
-            if 0 <= choice < len(domains):
-                selected_domain = domains[choice]
-                print(f"Preparing to update domain: {selected_domain}")
-                db_manager.reset_domain_crawl_status(selected_domain)
-                cursor = db_manager.connection.cursor()
-                cursor.execute("SELECT url FROM pages WHERE domain = ? ORDER BY discovered_at ASC LIMIT 1", (selected_domain,))
-                result = cursor.fetchone()
-                if result:
-                    start_url = result[0]
-                    print(f"Starting update from URL: {start_url}")
+            try:
+                choice = int(input("Enter the number of the domain: ")) - 1
+                if 0 <= choice < len(domains):
+                    selected_domain = domains[choice]
+                    print(f"Resetting and preparing to update domain: {selected_domain}")
+                    db_manager.reset_domain_crawl_status(selected_domain)
+                    crawler = WebCrawler(
+                        db_manager=db_manager,
+                        domain_to_crawl=selected_domain,
+                        max_depth=args.max_depth,
+                        delay=args.delay,
+                        use_selenium=args.use_selenium,
+                        disregard_robots=args.disregard_robots
+                    )
                 else:
-                    print(f"Could not find a starting URL for domain {selected_domain}.")
-                    return
-            else:
-                print("Invalid choice.")
+                    print("Invalid choice.")
+            except (ValueError, IndexError):
+                print("Invalid input.")
+
+        elif args.continue_crawl:
+            if db_manager.get_uncrawled_pages_count() == 0:
+                print("No pages left to crawl in the database.")
                 return
-        except (ValueError, IndexError):
-            print("Invalid input.")
-            return
-        finally:
-            db_manager.close()
 
-    if not start_url:
-        parser.error("A start_url is required, either as an argument or by selecting a domain with --update.")
+            crawler = WebCrawler(
+                db_manager=db_manager,
+                domain_to_crawl=None, # Crawl all domains
+                max_depth=args.max_depth,
+                delay=args.delay,
+                use_selenium=args.use_selenium,
+                disregard_robots=args.disregard_robots
+            )
 
-    crawler = WebCrawler(
-        start_url=start_url,
-        max_depth=args.max_depth,
-        delay=args.delay,
-        use_selenium=args.use_selenium,
-        disregard_robots=args.disregard_robots
-    )
+        if crawler:
+            crawler.start()
 
-    try:
-        crawler.start()
     except Exception as e:
-        logger.error(f"An unexpected error occurred during crawling: {e}")
-        crawler.cleanup()
+        logger.error(f"An unexpected error occurred: {e}")
+    finally:
+        if crawler:
+            crawler.cleanup()
+        db_manager.close()
+        print("\nOperation finished.")
 
 
 if __name__ == "__main__":
