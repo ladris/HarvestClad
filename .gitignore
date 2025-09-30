@@ -1,0 +1,27 @@
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Log files
+*.log
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Dependency directories
+.venv/
+venv/
+env/
+ENV/
+.env
+
+# WebDriver Manager cache
+.wdm/
+
+# Downloaded package files
+*.deb
