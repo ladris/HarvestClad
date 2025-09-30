@@ -534,11 +534,12 @@ class WebCrawler:
     """Main crawler class"""
     
     def __init__(self, start_url: str, max_depth: int = 3, 
-                 delay: float = 1.0, use_selenium: bool = True):
+                 delay: float = 1.0, use_selenium: bool = True, disregard_robots: bool = False):
         self.start_url = start_url
         self.max_depth = max_depth
         self.delay = delay
         self.use_selenium = use_selenium
+        self.disregard_robots = disregard_robots
         
         self.db = DatabaseManager()
         self.link_detector = LinkDetector(start_url)
@@ -838,15 +839,16 @@ class WebCrawler:
             page_id, url, depth = next_page
 
             # Check robots.txt before crawling
-            domain = urlparse(url).netloc
-            robot_parser = self.get_robot_parser(domain)
-            if robot_parser and not robot_parser.can_fetch(self.user_agent, url):
-                logger.info(f"Skipping (disallowed by robots.txt): {url}")
-                self.db.update_page_crawl(page_id, {
-                    'status_code': 403,  # Use a specific code for disallowed
-                    'error_message': 'Disallowed by robots.txt'
-                })
-                continue
+            if not self.disregard_robots:
+                domain = urlparse(url).netloc
+                robot_parser = self.get_robot_parser(domain)
+                if robot_parser and not robot_parser.can_fetch(self.user_agent, url):
+                    logger.info(f"Skipping (disallowed by robots.txt): {url}")
+                    self.db.update_page_crawl(page_id, {
+                        'status_code': 403,  # Use a specific code for disallowed
+                        'error_message': 'Disallowed by robots.txt'
+                    })
+                    continue
             
             if depth > self.max_depth:
                 logger.info(f"Max depth reached, skipping: {url}")
@@ -872,6 +874,7 @@ def main():
     parser.add_argument("-w", "--delay", type=float, default=1.0, help="Delay between requests in seconds.")
     parser.add_argument("-s", "--use-selenium", action='store_true', help="Use Selenium for dynamic content.")
     parser.add_argument("-u", "--update", action='store_true', help="Update an existing domain from the database.")
+    parser.add_argument("--disregard-robots", action='store_true', help="Disregard robots.txt and its rule settings.")
     
     args = parser.parse_args()
     
@@ -920,7 +923,8 @@ def main():
         start_url=start_url,
         max_depth=args.max_depth,
         delay=args.delay,
-        use_selenium=args.use_selenium
+        use_selenium=args.use_selenium,
+        disregard_robots=args.disregard_robots
     )
 
     try:
