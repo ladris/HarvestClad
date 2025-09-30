@@ -27,6 +27,8 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+import os
+import platform
 import threading
 
 # Configure logging
@@ -626,7 +628,17 @@ class WebCrawler:
             chrome_options.add_argument('--disable-gpu')
             chrome_options.add_argument(f'--user-agent={self.user_agent}')
             
-            service = Service(ChromeDriverManager().install())
+            # Check for local chromedriver
+            driver_name = "chromedriver.exe" if platform.system() == "Windows" else "chromedriver"
+            local_driver_path = os.path.abspath(driver_name)
+
+            if os.path.exists(local_driver_path):
+                logger.info(f"Using local chromedriver from: {local_driver_path}")
+                service = Service(executable_path=local_driver_path)
+            else:
+                logger.info("Local chromedriver not found, downloading...")
+                service = Service(ChromeDriverManager().install())
+
             self.driver = webdriver.Chrome(service=service, options=chrome_options)
             logger.info("Selenium WebDriver initialized")
         except Exception as e:
