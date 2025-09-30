@@ -437,14 +437,18 @@ class LinkDetector:
         for idx, tag in enumerate(soup.find_all('a', href=True)):
             url = self.normalize_url(tag['href'], current_url)
             if url:
+                rel_val = tag.get('rel')
+                rel_str = ' '.join(rel_val) if isinstance(rel_val, list) else rel_val
+                is_follow = 'nofollow' not in (rel_val or [])
+
                 links.append({
                     'target_url': url,
                     'text': tag.get_text(strip=True)[:500],
                     'title': tag.get('title'),
                     'type': 'anchor',
-                    'rel': tag.get('rel'),
+                    'rel': rel_str,
                     'is_internal': self.is_internal(url),
-                    'is_follow': 'nofollow' not in tag.get('rel', []),
+                    'is_follow': is_follow,
                     'is_external': not self.is_internal(url),
                     'position': position,
                     'detected_method': 'static_html',
@@ -460,10 +464,13 @@ class LinkDetector:
         for tag in soup.find_all('link', href=True):
             url = self.normalize_url(tag['href'], current_url)
             if url:
+                rel_val = tag.get('rel')
+                rel_str = ' '.join(rel_val) if isinstance(rel_val, list) else rel_val
+
                 links.append({
                     'target_url': url,
                     'type': 'link_tag',
-                    'rel': tag.get('rel'),
+                    'rel': rel_str,
                     'is_internal': self.is_internal(url),
                     'is_follow': True,
                     'is_external': not self.is_internal(url),
