@@ -63,6 +63,7 @@ class DatabaseManager:
                 url TEXT UNIQUE NOT NULL,
                 url_hash TEXT UNIQUE NOT NULL,
                 normalized_url TEXT,
+                normalized_url_hash TEXT UNIQUE,
                 domain TEXT,
                 scheme TEXT,
                 path TEXT,
@@ -166,6 +167,7 @@ class DatabaseManager:
         
         # Create indexes
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_url_hash ON pages(url_hash)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_normalized_url_hash ON pages(normalized_url_hash)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_is_crawled ON pages(is_crawled)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_domain ON pages(domain)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_target_hash ON links(target_url_hash)")
@@ -178,27 +180,41 @@ class DatabaseManager:
         """Generate hash for URL"""
         return hashlib.sha256(url.encode()).hexdigest()
     
-    def add_page(self, url: str, parent_url: str = None, depth: int = 0) -> int:
-        """Add page to database if not exists"""
+    def add_page(self, url: str, normalized_url: str, parent_url: str = None, depth: int = 0) -> Optional[int]:
+        """
+        Add page to the database if its normalized version doesn't exist yet.
+        Returns the ID of the existing or newly inserted page.
+        """
         cursor = self.connection.cursor()
+        normalized_url_hash = self.url_hash(normalized_url)
+
+        # First, check if a page with this normalized hash already exists
+        cursor.execute("SELECT id FROM pages WHERE normalized_url_hash = ?", (normalized_url_hash,))
+        result = cursor.fetchone()
+        if result:
+            return result[0]
+
+        # If it doesn't exist, insert the new page
         url_hash = self.url_hash(url)
         parsed = urlparse(url)
-        
         try:
             cursor.execute("""
-                INSERT OR IGNORE INTO pages 
-                (url, url_hash, normalized_url, domain, scheme, path, query_string, 
+                INSERT INTO pages
+                (url, url_hash, normalized_url, normalized_url_hash, domain, scheme, path, query_string,
                  fragment, discovered_at, crawl_depth, parent_url)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                url, url_hash, url.split('#')[0], parsed.netloc, parsed.scheme,
+                url, url_hash, normalized_url, normalized_url_hash, parsed.netloc, parsed.scheme,
                 parsed.path, parsed.query, parsed.fragment, datetime.now(),
                 depth, parent_url
             ))
             self.connection.commit()
             return cursor.lastrowid
         except sqlite3.IntegrityError:
-            cursor.execute("SELECT id FROM pages WHERE url_hash = ?", (url_hash,))
+            # This could happen in a race condition if another thread inserted the same normalized_url_hash
+            # between our SELECT and INSERT. We can now safely assume it exists.
+            logger.warning(f"IntegrityError on insert for url {url} (normalized: {normalized_url}), re-querying.")
+            cursor.execute("SELECT id FROM pages WHERE normalized_url_hash = ?", (normalized_url_hash,))
             result = cursor.fetchone()
             return result[0] if result else None
     
@@ -433,6 +449,51 @@ class LinkDetector:
         #                         parsed.params, parsed.query, ''))
         
         return absolute_url
+
+    def normalize_url_advanced(self, url: str, current_url: str) -> Optional[str]:
+        """
+        Performs advanced normalization on a URL:
+        - Resolves relative URLs to absolute.
+        - Converts scheme and netloc to lowercase.
+        - Removes default ports (80 for http, 443 for https).
+        - Removes fragment identifiers.
+        - Sorts query parameters alphabetically.
+        - Removes common tracking parameters.
+        """
+        if not url or url.startswith(('#', 'javascript:', 'mailto:', 'tel:')):
+            return None
+
+        absolute_url = urljoin(current_url, url)
+        parsed = urlparse(absolute_url)
+
+        # Common tracking parameters to remove
+        tracking_params = {'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
+                           'gclid', 'fbclid', 'msclkid'}
+
+        # Scheme and netloc to lowercase
+        scheme = parsed.scheme.lower()
+        netloc = parsed.netloc.lower()
+
+        # Remove default ports
+        if (scheme == 'http' and netloc.endswith(':80')) or \
+           (scheme == 'https' and netloc.endswith(':443')):
+            netloc = netloc.rsplit(':', 1)[0]
+
+        # Sort and filter query parameters
+        query_params = parse_qs(parsed.query)
+        sorted_filtered_params = sorted(
+            (k, v) for k, v in query_params.items() if k not in tracking_params
+        )
+
+        # Rebuild query string
+        encoded_query = urlencode(sorted_filtered_params, doseq=True)
+
+        path = parsed.path if parsed.path else '/'
+
+        # Reconstruct URL without fragment
+        normalized = urlunparse((scheme, netloc, path, '', encoded_query, ''))
+
+        return normalized
     
     def extract_static_links(self, soup: BeautifulSoup, current_url: str) -> List[Dict]:
         """Extract static HTML links"""
@@ -796,6 +857,60 @@ class ResourceExtractor:
         return embedded
 
 
+class UrlTrapDetector:
+    """Detects URL patterns that are likely to be crawler traps."""
+    def __init__(self, max_path_depth=10, max_repeating_segments=3, max_query_variations=5):
+        self.max_path_depth = max_path_depth
+        self.max_repeating_segments = max_repeating_segments
+        self.max_query_variations = max_query_variations
+
+        # Stores {path_without_query: {query_param_key_tuple, ...}}
+        self.path_query_structures: Dict[str, Set[tuple]] = {}
+
+    def is_trap(self, url: str) -> bool:
+        """Check if a URL is a potential trap."""
+        parsed = urlparse(url)
+        path = parsed.path
+
+        # 1. Check for excessive path depth
+        path_segments = [seg for seg in path.split('/') if seg]
+        if len(path_segments) > self.max_path_depth:
+            logger.warning(f"Trap detected: Excessive path depth in {url}")
+            return True
+
+        # 2. Check for repeating path segments
+        path_segment_counts = {}
+        for segment in path_segments:
+            path_segment_counts[segment] = path_segment_counts.get(segment, 0) + 1
+            if path_segment_counts[segment] > self.max_repeating_segments:
+                logger.warning(f"Trap detected: Repeating path segment '{segment}' in {url}")
+                return True
+
+        # 3. Check for too many query variations for the same path
+        path_base = parsed.path
+        query_params = parse_qs(parsed.query)
+        # Create a frozenset of parameter keys to represent the query structure
+        query_structure = frozenset(query_params.keys())
+
+        known_structures = self.path_query_structures.get(path_base, set())
+
+        if query_structure in known_structures:
+            return False  # Not a new trap, we've seen this structure before
+
+        # It's a new structure, check if adding it would exceed the limit
+        if len(known_structures) >= self.max_query_variations:
+            logger.warning(f"Trap detected: Excessive query variations for path '{path_base}' on new structure")
+            return True  # This new structure would be the N+1th variation
+
+        # If not a trap, add it to the known structures for future checks
+        if path_base not in self.path_query_structures:
+            self.path_query_structures[path_base] = {query_structure}
+        else:
+            self.path_query_structures[path_base].add(query_structure)
+
+        return False
+
+
 class WebCrawler:
     """Main crawler class"""
 
@@ -819,6 +934,7 @@ class WebCrawler:
 
         self.link_detector = LinkDetector(base_for_detector)
         self.resource_extractor = ResourceExtractor(base_for_detector)
+        self.trap_detector = UrlTrapDetector()
         self.user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (AdvancedCrawler/1.0)'
         self.robot_parsers = {}
         
@@ -869,7 +985,9 @@ class WebCrawler:
             urls = [loc.text.strip() for loc in root.findall('.//ns:loc', namespaces=namespace)]
             for url in urls:
                 if self.link_detector.is_internal(url):
-                    self.db.add_page(url, parent_url='sitemap', depth=0)
+                    normalized_url = self.link_detector.normalize_url_advanced(url, self.link_detector.base_url)
+                    if normalized_url:
+                        self.db.add_page(url, normalized_url, parent_url='sitemap', depth=0)
             logger.info(f"Added {len(urls)} URLs from sitemap to the queue.")
         except ET.ParseError as e:
             logger.error(f"Failed to parse sitemap XML: {e}")
@@ -968,7 +1086,9 @@ class WebCrawler:
                 for link in all_links:
                     self.db.add_link(page_id, link)
                     if link['is_internal'] and depth < self.max_depth:
-                        self.db.add_page(link['target_url'], parent_url=url, depth=depth + 1)
+                        normalized_url = self.link_detector.normalize_url_advanced(link['target_url'], url)
+                        if normalized_url and not self.trap_detector.is_trap(normalized_url):
+                            self.db.add_page(link['target_url'], normalized_url, parent_url=url, depth=depth + 1)
                 
                 # Extract and store resources
                 all_resources = self.resource_extractor.extract_all_resources(soup)
@@ -1030,7 +1150,9 @@ class WebCrawler:
             for link in all_links:
                 self.db.add_link(page_id, link)
                 if link['is_internal'] and depth < self.max_depth:
-                    self.db.add_page(link['target_url'], parent_url=url, depth=depth + 1)
+                    normalized_url = self.link_detector.normalize_url_advanced(link['target_url'], url)
+                    if normalized_url and not self.trap_detector.is_trap(normalized_url):
+                        self.db.add_page(link['target_url'], normalized_url, parent_url=url, depth=depth + 1)
 
             # Extract and store resources
             all_resources = self.resource_extractor.extract_all_resources(soup)
@@ -1059,7 +1181,8 @@ class WebCrawler:
 
         if self.start_url:
             domain = urlparse(self.start_url).netloc
-            self.db.add_page(self.start_url, depth=0)
+            normalized_start_url = self.link_detector.normalize_url_advanced(self.start_url, self.start_url)
+            self.db.add_page(self.start_url, normalized_start_url, depth=0)
             self.parse_sitemap(domain)
         
         self.print_initial_summary()
