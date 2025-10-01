@@ -358,6 +358,23 @@ class DatabaseManager:
         cursor.execute(query, params)
         return cursor.fetchone()
 
+    def get_all_uncrawled(self, domain: Optional[str] = None) -> List[tuple]:
+        """Get all uncrawled pages, optionally for a specific domain."""
+        cursor = self.connection.cursor()
+        query = """
+            SELECT id, url, crawl_depth
+            FROM pages
+            WHERE is_crawled = 0
+        """
+        params = []
+        if domain:
+            query += " AND domain = ?"
+            params.append(domain)
+
+        query += " ORDER BY crawl_depth ASC, discovered_at ASC"
+        cursor.execute(query, params)
+        return cursor.fetchall()
+
     def get_distinct_domains(self) -> List[str]:
         """Get a list of distinct domains from the pages table"""
         cursor = self.connection.cursor()
@@ -505,8 +522,19 @@ class LinkDetector:
             url = self.normalize_url(tag['href'], current_url)
             if url:
                 rel_val = tag.get('rel')
-                rel_str = ' '.join(rel_val) if isinstance(rel_val, list) else rel_val
-                is_follow = 'nofollow' not in (rel_val or [])
+
+                # Determine is_follow status
+                is_follow = True
+                if rel_val:
+                    rel_values = rel_val if isinstance(rel_val, list) else rel_val.split()
+                    if 'nofollow' in rel_values:
+                        is_follow = False
+
+                # Normalize rel attribute to a string for the database
+                if isinstance(rel_val, list):
+                    rel_str = ' '.join(rel_val)
+                else:
+                    rel_str = rel_val  # It's a string or None
 
                 links.append({
                     'target_url': url,
@@ -1253,22 +1281,20 @@ class CrawlerManager:
         self.crawler.print_initial_summary()
 
         # Populate the queue with initial URLs
-        page = self.db.get_next_uncrawled(self.domain_to_crawl)
-        while page:
+        uncrawled_pages = self.db.get_all_uncrawled(self.domain_to_crawl)
+        for page in uncrawled_pages:
             page_id, url, depth = page
             async with self.in_queue_lock:
                 if page_id not in self.in_queue:
                     self.in_queue.add(page_id)
                     await self.queue.put(page)
-            page = self.db.get_next_uncrawled(self.domain_to_crawl)
 
-        initial_pages = self.queue.qsize()
-        if initial_pages == 0:
+        if not uncrawled_pages:
             logger.info("No pages to crawl for the selected task.")
             if self.crawler: self.crawler.cleanup()
             return
 
-        logger.info(f"Populated queue with {initial_pages} pages for target: {self.domain_to_crawl or 'all domains'}")
+        logger.info(f"Populated queue with {self.queue.qsize()} pages for target: {self.domain_to_crawl or 'all domains'}")
 
         tasks = [asyncio.create_task(self.worker(f'worker-{i+1}')) for i in range(self.args.workers)]
 
