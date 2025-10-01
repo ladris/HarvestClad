@@ -156,6 +156,10 @@ class DatabaseManager:
                 load_time_ms INTEGER,
                 mime_type TEXT,
                 discovered_at TIMESTAMP,
+                source_tag TEXT,
+                source_attribute TEXT,
+                alt_text TEXT,
+                media_keywords TEXT,
                 FOREIGN KEY (page_id) REFERENCES pages(id)
             )
         """)
@@ -308,12 +312,14 @@ class DatabaseManager:
         cursor.execute("""
             INSERT INTO resources 
             (page_id, resource_url, resource_type, size_bytes, load_time_ms,
-             mime_type, discovered_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+             mime_type, discovered_at, source_tag, source_attribute, alt_text, media_keywords)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             page_id, resource_data.get('url'), resource_data.get('type'),
             resource_data.get('size'), resource_data.get('load_time'),
-            resource_data.get('mime_type'), datetime.now()
+            resource_data.get('mime_type'), datetime.now(),
+            resource_data.get('source_tag'), resource_data.get('source_attribute'),
+            resource_data.get('alt_text'), resource_data.get('media_keywords')
         ))
         self.connection.commit()
     
@@ -590,6 +596,206 @@ class LinkDetector:
         return links
 
 
+class ResourceExtractor:
+    """Extracts various resources from a BeautifulSoup object."""
+
+    def __init__(self, base_url: str):
+        self.base_url = base_url
+        self.base_domain = urlparse(base_url).netloc
+
+    def _normalize_url(self, url: str) -> Optional[str]:
+        """Normalize and resolve URL"""
+        if not url or url.startswith(('javascript:', 'mailto:', 'tel:')):
+            return None
+        return urljoin(self.base_url, url)
+
+    def extract_all_resources(self, soup: BeautifulSoup) -> List[Dict]:
+        """Extract all supported resources from the page."""
+        resources = []
+        resources.extend(self.extract_images(soup))
+        resources.extend(self.extract_videos(soup))
+        resources.extend(self.extract_audios(soup))
+        resources.extend(self.extract_documents(soup))
+        resources.extend(self.extract_scripts(soup))
+        resources.extend(self.extract_stylesheets(soup))
+        resources.extend(self.extract_favicons(soup))
+        resources.extend(self.extract_embedded_content(soup))
+        return resources
+
+    def extract_images(self, soup: BeautifulSoup) -> List[Dict]:
+        """Extracts image resources."""
+        images = []
+        # <img> tags
+        for tag in soup.find_all('img'):
+            src = self._normalize_url(tag.get('src'))
+            if src:
+                images.append({
+                    'url': src,
+                    'type': 'image',
+                    'source_tag': 'img',
+                    'source_attribute': 'src',
+                    'alt_text': tag.get('alt'),
+                    'media_keywords': 'image, img'
+                })
+        # <picture> tags
+        for tag in soup.find_all('picture'):
+            for source in tag.find_all('source'):
+                srcset = self._normalize_url(source.get('srcset'))
+                if srcset:
+                    images.append({
+                        'url': srcset,
+                        'type': 'image',
+                        'source_tag': 'picture',
+                        'source_attribute': 'srcset',
+                        'media_keywords': 'image, picture, source'
+                    })
+        # Background images from inline styles
+        for tag in soup.find_all(style=True):
+            style = tag['style']
+            match = re.search(r'url\((.*?)\)', style)
+            if match:
+                url = self._normalize_url(match.group(1).strip('\'"'))
+                if url:
+                    images.append({
+                        'url': url,
+                        'type': 'image',
+                        'source_tag': tag.name,
+                        'source_attribute': 'style',
+                        'media_keywords': 'image, background-image, css'
+                    })
+        return images
+
+    def extract_videos(self, soup: BeautifulSoup) -> List[Dict]:
+        """Extracts video resources."""
+        videos = []
+        for tag in soup.find_all('video'):
+            src = self._normalize_url(tag.get('src'))
+            if src:
+                videos.append({
+                    'url': src,
+                    'type': 'video',
+                    'source_tag': 'video',
+                    'source_attribute': 'src',
+                    'media_keywords': 'video'
+                })
+            for source in tag.find_all('source'):
+                src = self._normalize_url(source.get('src'))
+                if src:
+                    videos.append({
+                        'url': src,
+                        'type': 'video',
+                        'source_tag': 'source',
+                        'source_attribute': 'src',
+                        'media_keywords': 'video, source'
+                    })
+        return videos
+
+    def extract_audios(self, soup: BeautifulSoup) -> List[Dict]:
+        """Extracts audio resources."""
+        audios = []
+        for tag in soup.find_all('audio'):
+            src = self._normalize_url(tag.get('src'))
+            if src:
+                audios.append({
+                    'url': src,
+                    'type': 'audio',
+                    'source_tag': 'audio',
+                    'source_attribute': 'src',
+                    'media_keywords': 'audio'
+                })
+            for source in tag.find_all('source'):
+                src = self._normalize_url(source.get('src'))
+                if src:
+                    audios.append({
+                        'url': src,
+                        'type': 'audio',
+                        'source_tag': 'source',
+                        'source_attribute': 'src',
+                        'media_keywords': 'audio, source'
+                    })
+        return audios
+
+    def extract_documents(self, soup: BeautifulSoup) -> List[Dict]:
+        """Extracts links to documents."""
+        docs = []
+        doc_extensions = ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.zip', '.rar']
+        for tag in soup.find_all('a', href=True):
+            href = tag['href']
+            if any(href.lower().endswith(ext) for ext in doc_extensions):
+                url = self._normalize_url(href)
+                if url:
+                    docs.append({
+                        'url': url,
+                        'type': 'document',
+                        'source_tag': 'a',
+                        'source_attribute': 'href',
+                        'media_keywords': f"document, {href.split('.')[-1]}"
+                    })
+        return docs
+
+    def extract_scripts(self, soup: BeautifulSoup) -> List[Dict]:
+        """Extracts script resources."""
+        scripts = []
+        for tag in soup.find_all('script', src=True):
+            src = self._normalize_url(tag.get('src'))
+            if src:
+                scripts.append({
+                    'url': src,
+                    'type': 'script',
+                    'source_tag': 'script',
+                    'source_attribute': 'src',
+                    'media_keywords': 'script, javascript, js'
+                })
+        return scripts
+
+    def extract_stylesheets(self, soup: BeautifulSoup) -> List[Dict]:
+        """Extracts stylesheet resources."""
+        styles = []
+        for tag in soup.find_all('link', rel='stylesheet', href=True):
+            href = self._normalize_url(tag.get('href'))
+            if href:
+                styles.append({
+                    'url': href,
+                    'type': 'stylesheet',
+                    'source_tag': 'link',
+                    'source_attribute': 'href',
+                    'media_keywords': 'stylesheet, css'
+                })
+        return styles
+
+    def extract_favicons(self, soup: BeautifulSoup) -> List[Dict]:
+        """Extracts favicon resources."""
+        favicons = []
+        for tag in soup.find_all('link', rel=lambda r: r and 'icon' in r, href=True):
+            href = self._normalize_url(tag.get('href'))
+            if href:
+                favicons.append({
+                    'url': href,
+                    'type': 'favicon',
+                    'source_tag': 'link',
+                    'source_attribute': 'href',
+                    'media_keywords': 'favicon, icon'
+                })
+        return favicons
+
+    def extract_embedded_content(self, soup: BeautifulSoup) -> List[Dict]:
+        """Extracts embedded content like iframes, embeds, and objects."""
+        embedded = []
+        for tag_name in ['iframe', 'embed', 'object']:
+            for tag in soup.find_all(tag_name):
+                src_attr = 'src' if tag_name != 'object' else 'data'
+                src = self._normalize_url(tag.get(src_attr))
+                if src:
+                    embedded.append({
+                        'url': src,
+                        'type': f'embedded_{tag_name}',
+                        'source_tag': tag_name,
+                        'source_attribute': src_attr,
+                        'media_keywords': f'embedded, {tag_name}'
+                    })
+        return embedded
+
+
 class WebCrawler:
     """Main crawler class"""
 
@@ -612,6 +818,7 @@ class WebCrawler:
             raise ValueError("WebCrawler requires either a start_url or a domain_to_crawl.")
 
         self.link_detector = LinkDetector(base_for_detector)
+        self.resource_extractor = ResourceExtractor(base_for_detector)
         self.user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (AdvancedCrawler/1.0)'
         self.robot_parsers = {}
         
@@ -763,8 +970,13 @@ class WebCrawler:
                     if link['is_internal'] and depth < self.max_depth:
                         self.db.add_page(link['target_url'], parent_url=url, depth=depth + 1)
                 
+                # Extract and store resources
+                all_resources = self.resource_extractor.extract_all_resources(soup)
+                for resource in all_resources:
+                    self.db.add_resource(page_id, resource)
+
                 # Use logger for consistency, not print
-                logger.debug(f"Found {len(all_links)} links on {url}")
+                logger.debug(f"Found {len(all_links)} links and {len(all_resources)} resources on {url}")
         
         except Exception as e:
             logger.error(f"Error crawling {url}: {e}")
@@ -819,8 +1031,13 @@ class WebCrawler:
                 self.db.add_link(page_id, link)
                 if link['is_internal'] and depth < self.max_depth:
                     self.db.add_page(link['target_url'], parent_url=url, depth=depth + 1)
+
+            # Extract and store resources
+            all_resources = self.resource_extractor.extract_all_resources(soup)
+            for resource in all_resources:
+                self.db.add_resource(page_id, resource)
             
-            logger.debug(f"Found {len(all_links)} links (including {len(dynamic_links)} dynamic) on {url}")
+            logger.debug(f"Found {len(all_links)} links (including {len(dynamic_links)} dynamic) and {len(all_resources)} resources on {url}")
         except Exception as e:
             logger.error(f"Error with Selenium on {url}: {e}")
             page_data['error_message'] = str(e)
