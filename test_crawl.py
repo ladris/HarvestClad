@@ -267,11 +267,12 @@ class TestCrawlerManager(unittest.IsolatedAsyncioTestCase):
             new_scan=None,
             update=False,
             continue_crawl=True,
+            target_domain=None,
             max_depth=2,
             delay=0,
             workers=1,
             use_selenium=False,
-            disregard_robots=True
+            disregard_robots=True,
         )
 
     def tearDown(self):
@@ -340,6 +341,97 @@ class TestCrawlerManager(unittest.IsolatedAsyncioTestCase):
         test_can_continue.set()
         worker_task.cancel()
         await asyncio.gather(worker_task, return_exceptions=True)
+
+    @patch('requests.Session.get')
+    async def test_integration_add_link(self, mock_get):
+        """
+        Integration test to ensure that the 'links' table is populated
+        during a real crawl sequence, mocking only the HTTP request.
+        """
+        # 1. Setup mock HTTP response
+        start_url = "http://example.com"
+        linked_url = "http://example.com/linked_page"
+        html_content = f'<html><body><a href="{linked_url}">A Link</a></body></html>'
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = html_content.encode('utf-8')
+        mock_response.headers = {'Content-Type': 'text/html'}
+        mock_response.encoding = 'utf-8'
+        mock_response.history = []
+        mock_get.return_value = mock_response
+
+        # 2. Setup CrawlerManager and initial state
+        self.args.continue_crawl = True
+        self.args.target_domain = "example.com"
+        manager = CrawlerManager(self.db_manager, self.args)
+
+        # The manager.run() method creates its own crawler, so we must ensure
+        # it's configured correctly. We can do this by setting up the initial
+        # database state that manager.setup_crawler() will use.
+        normalized_start_url = manager.db.url_hash(start_url) # Simple normalization for test
+        page_id = self.db_manager.add_page(start_url, start_url, depth=0)
+
+
+        # 3. Run the manager
+        # The manager will fetch the uncrawled page, call the (mocked) network request,
+        # process the HTML, and should add the discovered link to the DB.
+        await manager.run()
+
+
+        # 4. Assert the link was added to the database
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT target_url FROM links WHERE source_page_id=?", (page_id,))
+        result = cursor.fetchone()
+        conn.close()
+
+        self.assertIsNotNone(result, "A link should have been inserted into the 'links' table.")
+        self.assertEqual(result[0], linked_url)
+
+    @patch('requests.Session.get')
+    async def test_add_link_with_rel_list(self, mock_get):
+        """
+        Tests that links are added correctly when the 'rel' attribute
+        is a list of strings, which can cause issues with some DB drivers.
+        """
+        # 1. Setup mock HTTP response
+        start_url = "http://example.com/rel-test"
+        linked_url = "http://example.com/linked_page"
+        # This HTML has a link with a 'rel' attribute that BeautifulSoup will parse into a list
+        html_content = f'<html><body><a href="{linked_url}" rel="noopener nofollow">A Link</a></body></html>'
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = html_content.encode('utf-8')
+        mock_response.headers = {'Content-Type': 'text/html'}
+        mock_response.encoding = 'utf-8'
+        mock_response.history = []
+        mock_get.return_value = mock_response
+
+        # 2. Setup CrawlerManager and initial state
+        self.args.continue_crawl = True
+        self.args.target_domain = "example.com"
+        manager = CrawlerManager(self.db_manager, self.args)
+
+        page_id = self.db_manager.add_page(start_url, start_url, depth=0)
+
+        # 3. Run the manager
+        await manager.run()
+
+        # 4. Assert the link was added and the 'rel' attribute was handled
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT target_url, link_rel, is_follow FROM links WHERE source_page_id=?", (page_id,))
+        result = cursor.fetchone()
+        conn.close()
+
+        self.assertIsNotNone(result, "Link should have been inserted even with a list 'rel' attribute.")
+        self.assertEqual(result[0], linked_url)
+        self.assertEqual(result[1], "noopener nofollow")
+        # is_follow should be False (represented as 0 in SQLite) because 'nofollow' is present
+        self.assertEqual(result[2], 0)
+
 
 if __name__ == '__main__':
     unittest.main()
