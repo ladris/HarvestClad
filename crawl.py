@@ -1035,6 +1035,54 @@ class WebCrawler:
             logger.warning(f"Could not initialize Selenium: {e}")
             self.use_selenium = False
     
+    def _process_page_content(self, soup: BeautifulSoup, url: str, page_id: int, depth: int, all_links: List[Dict]) -> Dict:
+        """
+        Extracts metadata from soup, and processes links and resources.
+        Returns a dictionary of the extracted metadata.
+        This is a helper method to consolidate logic from static and selenium crawls.
+        """
+        page_metadata = {}
+
+        # Extract metadata from the soup object
+        page_metadata['title'] = soup.title.string if soup.title else None
+        meta_desc = soup.find('meta', attrs={'name': 'description'})
+        page_metadata['meta_description'] = meta_desc['content'] if meta_desc else None
+        meta_keywords = soup.find('meta', attrs={'name': 'keywords'})
+        page_metadata['meta_keywords'] = meta_keywords['content'] if meta_keywords else None
+        canonical = soup.find('link', attrs={'rel': 'canonical'})
+        page_metadata['canonical_url'] = canonical['href'] if canonical else None
+        robots = soup.find('meta', attrs={'name': 'robots'})
+        page_metadata['robots_meta'] = robots['content'] if robots else None
+        og_title = soup.find('meta', property='og:title')
+        page_metadata['og_title'] = og_title['content'] if og_title else None
+        og_desc = soup.find('meta', property='og:description')
+        page_metadata['og_description'] = og_desc['content'] if og_desc else None
+        og_img = soup.find('meta', property='og:image')
+        page_metadata['og_image'] = og_img['content'] if og_img else None
+        og_type = soup.find('meta', property='og:type')
+        page_metadata['og_type'] = og_type['content'] if og_type else None
+        tw_card = soup.find('meta', attrs={'name': 'twitter:card'})
+        page_metadata['twitter_card'] = tw_card['content'] if tw_card else None
+        lang = soup.find('html')
+        page_metadata['language'] = lang.get('lang') if lang else None
+
+        # Process all links passed to the function
+        for link in all_links:
+            self.db.add_link(page_id, link)
+            if link['is_internal'] and depth < self.max_depth:
+                normalized_url = self.link_detector.normalize_url_advanced(link['target_url'], url)
+                if normalized_url and not self.trap_detector.is_trap(normalized_url):
+                    self.db.add_page(link['target_url'], normalized_url, parent_url=url, depth=depth + 1)
+
+        # Extract and store all resources from the soup
+        all_resources = self.resource_extractor.extract_all_resources(soup)
+        for resource in all_resources:
+            self.db.add_resource(page_id, resource)
+
+        logger.debug(f"Processed {len(all_links)} links and {len(all_resources)} resources on {url}")
+
+        return page_metadata
+
     def crawl_page_static(self, url: str, page_id: int, depth: int) -> Dict:
         """Crawl page using requests"""
         start_time = time.time()
@@ -1057,46 +1105,13 @@ class WebCrawler:
             if response.status_code == 200:
                 soup = BeautifulSoup(response.content, 'html.parser')
                 
-                # Extract metadata
-                page_data['title'] = soup.title.string if soup.title else None
-                meta_desc = soup.find('meta', attrs={'name': 'description'})
-                page_data['meta_description'] = meta_desc['content'] if meta_desc else None
-                meta_keywords = soup.find('meta', attrs={'name': 'keywords'})
-                page_data['meta_keywords'] = meta_keywords['content'] if meta_keywords else None
-                canonical = soup.find('link', attrs={'rel': 'canonical'})
-                page_data['canonical_url'] = canonical['href'] if canonical else None
-                robots = soup.find('meta', attrs={'name': 'robots'})
-                page_data['robots_meta'] = robots['content'] if robots else None
-                og_title = soup.find('meta', property='og:title')
-                page_data['og_title'] = og_title['content'] if og_title else None
-                og_desc = soup.find('meta', property='og:description')
-                page_data['og_description'] = og_desc['content'] if og_desc else None
-                og_img = soup.find('meta', property='og:image')
-                page_data['og_image'] = og_img['content'] if og_img else None
-                og_type = soup.find('meta', property='og:type')
-                page_data['og_type'] = og_type['content'] if og_type else None
-                tw_card = soup.find('meta', attrs={'name': 'twitter:card'})
-                page_data['twitter_card'] = tw_card['content'] if tw_card else None
-                lang = soup.find('html')
-                page_data['language'] = lang.get('lang') if lang else None
-                
+                # Get links from soup
                 all_links = self.link_detector.extract_static_links(soup, url) + \
                             self.link_detector.extract_javascript_links(soup, url)
                 
-                for link in all_links:
-                    self.db.add_link(page_id, link)
-                    if link['is_internal'] and depth < self.max_depth:
-                        normalized_url = self.link_detector.normalize_url_advanced(link['target_url'], url)
-                        if normalized_url and not self.trap_detector.is_trap(normalized_url):
-                            self.db.add_page(link['target_url'], normalized_url, parent_url=url, depth=depth + 1)
-                
-                # Extract and store resources
-                all_resources = self.resource_extractor.extract_all_resources(soup)
-                for resource in all_resources:
-                    self.db.add_resource(page_id, resource)
-
-                # Use logger for consistency, not print
-                logger.debug(f"Found {len(all_links)} links and {len(all_resources)} resources on {url}")
+                # Process the page content using the helper
+                content_data = self._process_page_content(soup, url, page_id, depth, all_links)
+                page_data.update(content_data)
         
         except Exception as e:
             logger.error(f"Error crawling {url}: {e}")
@@ -1117,9 +1132,7 @@ class WebCrawler:
             page_source = self.driver.page_source
             soup = BeautifulSoup(page_source, 'html.parser')
             
-            page_data['title'] = self.driver.title
-            page_data['status_code'] = 200
-            
+            # Extract all links (static, JS, and dynamic)
             static_links = self.link_detector.extract_static_links(soup, url)
             js_links = self.link_detector.extract_javascript_links(soup, url)
             dynamic_links = []
@@ -1147,19 +1160,15 @@ class WebCrawler:
                     continue
             
             all_links = static_links + js_links + dynamic_links
-            for link in all_links:
-                self.db.add_link(page_id, link)
-                if link['is_internal'] and depth < self.max_depth:
-                    normalized_url = self.link_detector.normalize_url_advanced(link['target_url'], url)
-                    if normalized_url and not self.trap_detector.is_trap(normalized_url):
-                        self.db.add_page(link['target_url'], normalized_url, parent_url=url, depth=depth + 1)
-
-            # Extract and store resources
-            all_resources = self.resource_extractor.extract_all_resources(soup)
-            for resource in all_resources:
-                self.db.add_resource(page_id, resource)
             
-            logger.debug(f"Found {len(all_links)} links (including {len(dynamic_links)} dynamic) and {len(all_resources)} resources on {url}")
+            # Process the page content using the helper
+            content_data = self._process_page_content(soup, url, page_id, depth, all_links)
+            page_data.update(content_data)
+
+            # Selenium-specific overrides
+            page_data['title'] = self.driver.title
+            page_data['status_code'] = 200
+
         except Exception as e:
             logger.error(f"Error with Selenium on {url}: {e}")
             page_data['error_message'] = str(e)
@@ -1243,6 +1252,75 @@ class WebCrawler:
             self.driver.quit()
 
 
+def handle_new_scan(args: argparse.Namespace, db_manager: DatabaseManager) -> Optional[WebCrawler]:
+    """Handles the --new-scan mode."""
+    start_url = args.new_scan
+    domain = urlparse(start_url).netloc
+    if db_manager.get_total_pages_count(domain) > 0:
+        choice = input(f"Data for domain '{domain}' already exists. Delete it and start a fresh scan? (y/n): ").lower()
+        if choice == 'y':
+            db_manager.delete_domain_data(domain)
+        else:
+            print("Aborting scan.")
+            return None
+
+    return WebCrawler(
+        db_manager=db_manager,
+        start_url=start_url,
+        domain_to_crawl=domain,
+        max_depth=args.max_depth,
+        delay=args.delay,
+        use_selenium=args.use_selenium,
+        disregard_robots=args.disregard_robots
+    )
+
+def handle_update(args: argparse.Namespace, db_manager: DatabaseManager) -> Optional[WebCrawler]:
+    """Handles the --update mode."""
+    domains = db_manager.get_distinct_domains()
+    if not domains:
+        print("No domains found in the database to update.")
+        return None
+
+    print("Please choose a domain to update:")
+    for i, domain in enumerate(domains):
+        print(f"{i + 1}: {domain}")
+
+    try:
+        choice = int(input("Enter the number of the domain: ")) - 1
+        if 0 <= choice < len(domains):
+            selected_domain = domains[choice]
+            print(f"Resetting and preparing to update domain: {selected_domain}")
+            db_manager.reset_domain_crawl_status(selected_domain)
+            return WebCrawler(
+                db_manager=db_manager,
+                domain_to_crawl=selected_domain,
+                max_depth=args.max_depth,
+                delay=args.delay,
+                use_selenium=args.use_selenium,
+                disregard_robots=args.disregard_robots
+            )
+        else:
+            print("Invalid choice.")
+            return None
+    except (ValueError, IndexError):
+        print("Invalid input.")
+        return None
+
+def handle_continue_crawl(args: argparse.Namespace, db_manager: DatabaseManager) -> Optional[WebCrawler]:
+    """Handles the --continue-crawl mode."""
+    if db_manager.get_uncrawled_pages_count() == 0:
+        print("No pages left to crawl in the database.")
+        return None
+
+    return WebCrawler(
+        db_manager=db_manager,
+        domain_to_crawl=None,  # Crawl all domains
+        max_depth=args.max_depth,
+        delay=args.delay,
+        use_selenium=args.use_selenium,
+        disregard_robots=args.disregard_robots
+    )
+
 def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(
@@ -1266,68 +1344,11 @@ def main():
 
     try:
         if args.new_scan:
-            start_url = args.new_scan
-            domain = urlparse(start_url).netloc
-            if db_manager.get_total_pages_count(domain) > 0:
-                choice = input(f"Data for domain '{domain}' already exists. Delete it and start a fresh scan? (y/n): ").lower()
-                if choice == 'y':
-                    db_manager.delete_domain_data(domain)
-                else:
-                    print("Aborting scan.")
-                    return
-
-            crawler = WebCrawler(
-                db_manager=db_manager,
-                start_url=start_url,
-                domain_to_crawl=domain,
-                max_depth=args.max_depth,
-                delay=args.delay,
-                use_selenium=args.use_selenium,
-                disregard_robots=args.disregard_robots
-            )
-
+            crawler = handle_new_scan(args, db_manager)
         elif args.update:
-            domains = db_manager.get_distinct_domains()
-            if not domains:
-                print("No domains found in the database to update.")
-                return
-
-            print("Please choose a domain to update:")
-            for i, domain in enumerate(domains):
-                print(f"{i + 1}: {domain}")
-
-            try:
-                choice = int(input("Enter the number of the domain: ")) - 1
-                if 0 <= choice < len(domains):
-                    selected_domain = domains[choice]
-                    print(f"Resetting and preparing to update domain: {selected_domain}")
-                    db_manager.reset_domain_crawl_status(selected_domain)
-                    crawler = WebCrawler(
-                        db_manager=db_manager,
-                        domain_to_crawl=selected_domain,
-                        max_depth=args.max_depth,
-                        delay=args.delay,
-                        use_selenium=args.use_selenium,
-                        disregard_robots=args.disregard_robots
-                    )
-                else:
-                    print("Invalid choice.")
-            except (ValueError, IndexError):
-                print("Invalid input.")
-
+            crawler = handle_update(args, db_manager)
         elif args.continue_crawl:
-            if db_manager.get_uncrawled_pages_count() == 0:
-                print("No pages left to crawl in the database.")
-                return
-
-            crawler = WebCrawler(
-                db_manager=db_manager,
-                domain_to_crawl=None, # Crawl all domains
-                max_depth=args.max_depth,
-                delay=args.delay,
-                use_selenium=args.use_selenium,
-                disregard_robots=args.disregard_robots
-            )
+            crawler = handle_continue_crawl(args, db_manager)
 
         if crawler:
             crawler.start()
