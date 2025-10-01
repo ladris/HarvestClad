@@ -137,5 +137,95 @@ class TestDatabaseManager(unittest.TestCase):
         self.assertEqual(row[2], 'http://example.com/image.jpg')
         self.assertEqual(row[3], 'image')
 
+from bs4 import BeautifulSoup
+class TestResourceExtractor(unittest.TestCase):
+    def setUp(self):
+        self.base_url = "http://example.com"
+        self.extractor = ResourceExtractor(base_url=self.base_url)
+        self.sample_html = """
+        <html>
+            <head>
+                <link rel="stylesheet" href="/style.css">
+                <link rel="icon" href="favicon.ico">
+                <script src="script.js"></script>
+            </head>
+            <body>
+                <img src="image.jpg" alt="test image">
+                <div style="background-image: url('bg.png');"></div>
+                <picture>
+                    <source srcset="image.webp" type="image/webp">
+                    <img src="image2.jpg">
+                </picture>
+
+                <video src="video.mp4"></video>
+                <audio>
+                    <source src="audio.mp3" type="audio/mpeg">
+                </audio>
+
+                <a href="document.pdf">Download PDF</a>
+                <a href="/archive.zip">Download ZIP</a>
+
+                <iframe src="embed.html"></iframe>
+                <embed src="flash.swf">
+                <object data="object.svg"></object>
+            </body>
+        </html>
+        """
+        self.soup = BeautifulSoup(self.sample_html, 'html.parser')
+
+    def test_extract_images(self):
+        images = self.extractor.extract_images(self.soup)
+        urls = {img['url'] for img in images}
+        self.assertEqual(len(images), 4)
+        self.assertIn("http://example.com/image.jpg", urls)
+        self.assertIn("http://example.com/bg.png", urls)
+        self.assertIn("http://example.com/image.webp", urls)
+        self.assertIn("http://example.com/image2.jpg", urls)
+
+    def test_extract_videos(self):
+        videos = self.extractor.extract_videos(self.soup)
+        self.assertEqual(len(videos), 1)
+        self.assertEqual(videos[0]['url'], "http://example.com/video.mp4")
+
+    def test_extract_audios(self):
+        audios = self.extractor.extract_audios(self.soup)
+        self.assertEqual(len(audios), 1)
+        self.assertEqual(audios[0]['url'], "http://example.com/audio.mp3")
+
+    def test_extract_documents(self):
+        docs = self.extractor.extract_documents(self.soup)
+        urls = {doc['url'] for doc in docs}
+        self.assertEqual(len(docs), 2)
+        self.assertIn("http://example.com/document.pdf", urls)
+        self.assertIn("http://example.com/archive.zip", urls)
+
+    def test_extract_scripts(self):
+        scripts = self.extractor.extract_scripts(self.soup)
+        self.assertEqual(len(scripts), 1)
+        self.assertEqual(scripts[0]['url'], "http://example.com/script.js")
+
+    def test_extract_stylesheets(self):
+        styles = self.extractor.extract_stylesheets(self.soup)
+        self.assertEqual(len(styles), 1)
+        self.assertEqual(styles[0]['url'], "http://example.com/style.css")
+
+    def test_extract_favicons(self):
+        favicons = self.extractor.extract_favicons(self.soup)
+        self.assertEqual(len(favicons), 1)
+        self.assertEqual(favicons[0]['url'], "http://example.com/favicon.ico")
+
+    def test_extract_embedded_content(self):
+        embedded = self.extractor.extract_embedded_content(self.soup)
+        urls = {item['url'] for item in embedded}
+        self.assertEqual(len(embedded), 3)
+        self.assertIn("http://example.com/embed.html", urls)
+        self.assertIn("http://example.com/flash.swf", urls)
+        self.assertIn("http://example.com/object.svg", urls)
+
+    def test_extract_all_resources(self):
+        resources = self.extractor.extract_all_resources(self.soup)
+        # 4 images + 1 video + 1 audio + 2 docs + 1 script + 1 style + 1 favicon + 3 embedded = 14
+        self.assertEqual(len(resources), 14)
+
 if __name__ == '__main__':
     unittest.main()
