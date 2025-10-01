@@ -1309,37 +1309,57 @@ class CrawlerManager:
             return crawler
 
         elif self.args.update:
-            domains = self.db.get_distinct_domains()
-            if not domains:
-                print("No domains found in the database to update.")
-                return None
-
-            print("Please choose a domain to update:")
-            for i, domain in enumerate(domains):
-                print(f"{i + 1}: {domain}")
-
-            try:
-                choice = int(input("Enter the number of the domain: ")) - 1
-                if 0 <= choice < len(domains):
-                    self.domain_to_crawl = domains[choice]
-                    print(f"Resetting and preparing to update domain: {self.domain_to_crawl}")
-                    self.db.reset_domain_crawl_status(self.domain_to_crawl)
-                else:
-                    print("Invalid choice.")
+            target_domain = self.args.target_domain
+            if target_domain:
+                # Non-interactive: use the specified domain
+                if target_domain not in self.db.get_distinct_domains():
+                    print(f"Error: Domain '{target_domain}' not found in the database. Cannot update.")
                     return None
-            except (ValueError, IndexError):
-                print("Invalid input.")
-                return None
+                self.domain_to_crawl = target_domain
+            else:
+                # Interactive: prompt user to choose from existing domains
+                domains = self.db.get_distinct_domains()
+                if not domains:
+                    print("No domains found in the database to update.")
+                    return None
+                print("Please choose a domain to update:")
+                for i, domain in enumerate(domains):
+                    print(f"{i + 1}: {domain}")
+                try:
+                    choice = int(input("Enter the number of the domain: ")) - 1
+                    if 0 <= choice < len(domains):
+                        self.domain_to_crawl = domains[choice]
+                    else:
+                        print("Invalid choice.")
+                        return None
+                except (ValueError, IndexError):
+                    print("Invalid input.")
+                    return None
+
+            print(f"Resetting and preparing to update domain: {self.domain_to_crawl}")
+            self.db.reset_domain_crawl_status(self.domain_to_crawl)
 
         elif self.args.continue_crawl:
-            if self.db.get_uncrawled_pages_count() == 0:
-                print("No pages left to crawl in the database.")
+            self.domain_to_crawl = self.args.target_domain
+            if self.db.get_uncrawled_pages_count(self.domain_to_crawl) == 0:
+                msg = f"for domain '{self.domain_to_crawl}'" if self.domain_to_crawl else "in the database"
+                print(f"No pages left to crawl {msg}.")
                 return None
-            self.domain_to_crawl = None  # Crawl all domains
 
-        # Default crawler for update/continue
+        # Determine the base URL for the crawler instance, which is essential for link/resource tools.
+        base_domain_for_init = self.domain_to_crawl
+        if not base_domain_for_init:
+            # If continuing for all domains, we need a base context. Pick the first one.
+            # This is a limitation of the current design, but it prevents a crash.
+            all_domains = self.db.get_distinct_domains()
+            if not all_domains:
+                print("Cannot initialize crawler: No domains found in database.")
+                return None
+            base_domain_for_init = all_domains[0]
+            logger.warning(f"No specific domain provided for crawl. Using '{base_domain_for_init}' as base context for crawler tools.")
+
         return WebCrawler(
-            db_manager=self.db, domain_to_crawl=self.domain_to_crawl,
+            db_manager=self.db, start_url=f"http://{base_domain_for_init}", domain_to_crawl=self.domain_to_crawl,
             max_depth=self.args.max_depth, delay=self.args.delay,
             use_selenium=self.args.use_selenium, disregard_robots=self.args.disregard_robots
         )
@@ -1353,17 +1373,22 @@ def main():
     )
 
     mode_group = parser.add_mutually_exclusive_group(required=True)
-    mode_group.add_argument("--new-scan", metavar="URL", help="Start a new scan from a URL. Deletes old data for the domain if it exists.")
-    mode_group.add_argument("--update", action="store_true", help="Update an existing domain by re-crawling all its pages.")
-    mode_group.add_argument("--continue-crawl", action="store_true", help="Continue the last crawl, processing any remaining uncrawled links.")
+    mode_group.add_argument("--new-scan", metavar="URL", help="Start a new scan from a root URL. This will trigger a prompt to delete any existing data for that domain.")
+    mode_group.add_argument("--update", action="store_true", help="Update an existing domain by re-crawling all its pages. Use with -t to specify a domain.")
+    mode_group.add_argument("--continue-crawl", action="store_true", help="Continue a crawl, processing any uncrawled links. Use with -t to limit to a domain.")
 
+    parser.add_argument("-t", "--target-domain", help="Specify the target domain for --update or --continue-crawl modes.")
     parser.add_argument("-d", "--max-depth", type=int, default=3, help="Maximum crawl depth. Default: 3")
     parser.add_argument("-w", "--delay", type=float, default=1.0, help="Delay between requests in seconds. Default: 1.0")
     parser.add_argument("--workers", type=int, default=4, help="Number of concurrent crawler workers. Default: 4")
-    parser.add_argument("-s", "--use-selenium", action='store_true', help="Use Selenium for dynamic content (Note: Selenium runs sequentially, not in parallel).")
+    parser.add_argument("-s", "--use-selenium", action='store_true', help="Use Selenium for dynamic content (slower, but handles JS-rendered pages).")
     parser.add_argument("--disregard-robots", action='store_true', help="Disregard robots.txt rules.")
     
     args = parser.parse_args()
+
+    if args.new_scan and args.target_domain:
+        parser.error("--target-domain cannot be used with --new-scan. The domain is derived from the URL.")
+
     db_manager = DatabaseManager()
 
     # The new async manager will handle the logic, replacing the old synchronous flow
