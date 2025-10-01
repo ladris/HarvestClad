@@ -30,6 +30,8 @@ from selenium.webdriver.support import expected_conditions as EC
 import os
 import platform
 import threading
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 # Configure logging
 logging.basicConfig(
@@ -114,7 +116,6 @@ class DatabaseManager:
                 is_external BOOLEAN,
                 xpath TEXT,
                 css_selector TEXT,
-                position_index INTEGER,
                 detected_method TEXT,
                 is_javascript BOOLEAN DEFAULT 0,
                 is_dynamic BOOLEAN DEFAULT 0,
@@ -126,7 +127,7 @@ class DatabaseManager:
                 link_context TEXT,
                 discovered_at TIMESTAMP,
                 FOREIGN KEY (source_page_id) REFERENCES pages(id),
-                UNIQUE(source_page_id, target_url_hash, position_index)
+                UNIQUE(source_page_id, target_url_hash)
             )
         """)
         
@@ -284,18 +285,18 @@ class DatabaseManager:
                 INSERT OR IGNORE INTO links 
                 (source_page_id, target_url, target_url_hash, link_text, link_title,
                  link_type, link_rel, is_internal, is_follow, is_external,
-                 xpath, css_selector, position_index, detected_method,
+                 xpath, css_selector, detected_method,
                  is_javascript, is_dynamic, onclick_handler, href_attribute,
                  data_attributes, aria_label, surrounding_text, link_context,
                  discovered_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 source_page_id, link_data['target_url'], target_hash,
                 link_data.get('text'), link_data.get('title'),
                 link_data.get('type'), link_data.get('rel'),
                 link_data.get('is_internal'), link_data.get('is_follow'),
                 link_data.get('is_external'), link_data.get('xpath'),
-                link_data.get('css_selector'), link_data.get('position'),
+                link_data.get('css_selector'),
                 link_data.get('detected_method'), link_data.get('is_javascript'),
                 link_data.get('is_dynamic'), link_data.get('onclick'),
                 link_data.get('href'), link_data.get('data_attributes'),
@@ -498,10 +499,9 @@ class LinkDetector:
     def extract_static_links(self, soup: BeautifulSoup, current_url: str) -> List[Dict]:
         """Extract static HTML links"""
         links = []
-        position = 0
         
         # <a> tags
-        for idx, tag in enumerate(soup.find_all('a', href=True)):
+        for tag in soup.find_all('a', href=True):
             url = self.normalize_url(tag['href'], current_url)
             if url:
                 rel_val = tag.get('rel')
@@ -517,7 +517,6 @@ class LinkDetector:
                     'is_internal': self.is_internal(url),
                     'is_follow': is_follow,
                     'is_external': not self.is_internal(url),
-                    'position': position,
                     'detected_method': 'static_html',
                     'is_javascript': False,
                     'is_dynamic': False,
@@ -525,7 +524,6 @@ class LinkDetector:
                     'aria_label': tag.get('aria-label'),
                     'data_attributes': json.dumps({k: v for k, v in tag.attrs.items() if k.startswith('data-')})
                 })
-                position += 1
         
         # <link> tags
         for tag in soup.find_all('link', href=True):
@@ -541,13 +539,11 @@ class LinkDetector:
                     'is_internal': self.is_internal(url),
                     'is_follow': True,
                     'is_external': not self.is_internal(url),
-                    'position': position,
                     'detected_method': 'static_html',
                     'is_javascript': False,
                     'is_dynamic': False,
                     'href': tag.get('href')
                 })
-                position += 1
         
         # <form> actions
         for tag in soup.find_all('form', action=True):
@@ -559,13 +555,11 @@ class LinkDetector:
                     'is_internal': self.is_internal(url),
                     'is_follow': True,
                     'is_external': not self.is_internal(url),
-                    'position': position,
                     'detected_method': 'static_html',
                     'is_javascript': False,
                     'is_dynamic': False,
                     'href': tag.get('action')
                 })
-                position += 1
         
         # <iframe> src
         for tag in soup.find_all('iframe', src=True):
@@ -577,13 +571,11 @@ class LinkDetector:
                     'is_internal': self.is_internal(url),
                     'is_follow': True,
                     'is_external': not self.is_internal(url),
-                    'position': position,
                     'detected_method': 'static_html',
                     'is_javascript': False,
                     'is_dynamic': False,
                     'href': tag.get('src')
                 })
-                position += 1
         
         # onclick attributes
         for tag in soup.find_all(onclick=True):
@@ -597,13 +589,11 @@ class LinkDetector:
                     'is_internal': self.is_internal(url),
                     'is_follow': True,
                     'is_external': not self.is_internal(url),
-                    'position': position,
                     'detected_method': 'onclick_attribute',
                     'is_javascript': True,
                     'is_dynamic': False,
                     'onclick': onclick[:1000]
                 })
-                position += 1
         
         return links
     
@@ -633,7 +623,6 @@ class LinkDetector:
     def extract_javascript_links(self, soup: BeautifulSoup, current_url: str) -> List[Dict]:
         """Extract links from JavaScript code"""
         links = []
-        position = 0
         
         for script in soup.find_all('script'):
             script_content = script.string or ''
@@ -646,13 +635,11 @@ class LinkDetector:
                     'is_internal': self.is_internal(url),
                     'is_follow': True,
                     'is_external': not self.is_internal(url),
-                    'position': position,
                     'detected_method': 'javascript_code',
                     'is_javascript': True,
                     'is_dynamic': False,
                     'context': script_content[:500] if len(script_content) > 500 else script_content
                 })
-                position += 1
         
         return links
 
@@ -1035,13 +1022,13 @@ class WebCrawler:
             logger.warning(f"Could not initialize Selenium: {e}")
             self.use_selenium = False
     
-    def _process_page_content(self, soup: BeautifulSoup, url: str, page_id: int, depth: int, all_links: List[Dict]) -> Dict:
+    def _process_page_content(self, soup: BeautifulSoup, url: str, page_id: int, depth: int, all_links: List[Dict]) -> (Dict, List):
         """
-        Extracts metadata from soup, and processes links and resources.
-        Returns a dictionary of the extracted metadata.
-        This is a helper method to consolidate logic from static and selenium crawls.
+        Extracts metadata from soup, processes links and resources.
+        Returns extracted metadata and a list of new internal pages to be queued.
         """
         page_metadata = {}
+        new_internal_pages = []
 
         # Extract metadata from the soup object
         page_metadata['title'] = soup.title.string if soup.title else None
@@ -1066,27 +1053,34 @@ class WebCrawler:
         lang = soup.find('html')
         page_metadata['language'] = lang.get('lang') if lang else None
 
-        # Process all links passed to the function
+        # Process links
         for link in all_links:
             self.db.add_link(page_id, link)
-            if link['is_internal'] and depth < self.max_depth:
-                normalized_url = self.link_detector.normalize_url_advanced(link['target_url'], url)
-                if normalized_url and not self.trap_detector.is_trap(normalized_url):
-                    self.db.add_page(link['target_url'], normalized_url, parent_url=url, depth=depth + 1)
+            normalized_url = self.link_detector.normalize_url_advanced(link['target_url'], url)
+            if not normalized_url or self.trap_detector.is_trap(normalized_url):
+                continue
 
-        # Extract and store all resources from the soup
+            if link['is_internal']:
+                if depth < self.max_depth:
+                    # Return to the worker to be added to the DB and queue
+                    new_internal_pages.append((link['target_url'], normalized_url, url, depth + 1))
+            else:
+                # External links are added directly, as they don't go into the current crawl queue
+                self.db.add_page(link['target_url'], normalized_url, parent_url=None, depth=0)
+
+        # Process resources
         all_resources = self.resource_extractor.extract_all_resources(soup)
         for resource in all_resources:
             self.db.add_resource(page_id, resource)
 
         logger.debug(f"Processed {len(all_links)} links and {len(all_resources)} resources on {url}")
+        return page_metadata, new_internal_pages
 
-        return page_metadata
-
-    def crawl_page_static(self, url: str, page_id: int, depth: int) -> Dict:
+    def crawl_page_static(self, url: str, page_id: int, depth: int) -> (Dict, List):
         """Crawl page using requests"""
         start_time = time.time()
         page_data = {}
+        new_pages = []
         
         try:
             response = self.session.get(url, timeout=30, allow_redirects=True)
@@ -1104,24 +1098,22 @@ class WebCrawler:
             
             if response.status_code == 200:
                 soup = BeautifulSoup(response.content, 'html.parser')
-                
-                # Get links from soup
                 all_links = self.link_detector.extract_static_links(soup, url) + \
                             self.link_detector.extract_javascript_links(soup, url)
                 
-                # Process the page content using the helper
-                content_data = self._process_page_content(soup, url, page_id, depth, all_links)
+                content_data, new_pages = self._process_page_content(soup, url, page_id, depth, all_links)
                 page_data.update(content_data)
         
         except Exception as e:
             logger.error(f"Error crawling {url}: {e}")
             page_data['error_message'] = str(e)
         
-        return page_data
+        return page_data, new_pages
     
-    def crawl_page_selenium(self, url: str, page_id: int, depth: int) -> Dict:
+    def crawl_page_selenium(self, url: str, page_id: int, depth: int) -> (Dict, List):
         """Crawl page using Selenium for dynamic content"""
         page_data = {}
+        new_pages = []
         start_time = time.time()
         try:
             self.driver.get(url)
@@ -1132,13 +1124,12 @@ class WebCrawler:
             page_source = self.driver.page_source
             soup = BeautifulSoup(page_source, 'html.parser')
             
-            # Extract all links (static, JS, and dynamic)
             static_links = self.link_detector.extract_static_links(soup, url)
             js_links = self.link_detector.extract_javascript_links(soup, url)
             dynamic_links = []
             
             clickable_elements = self.driver.find_elements(By.XPATH, "//*[@onclick or @href or contains(@class, 'link') or contains(@class, 'btn')]")
-            for idx, element in enumerate(clickable_elements[:100]):
+            for element in clickable_elements[:100]:
                 try:
                     href = element.get_attribute('href')
                     onclick = element.get_attribute('onclick')
@@ -1152,7 +1143,7 @@ class WebCrawler:
                         dynamic_links.append({
                             'target_url': detected_url, 'text': element.text[:500], 'type': 'dynamic',
                             'is_internal': self.link_detector.is_internal(detected_url), 'is_follow': True,
-                            'is_external': not self.link_detector.is_internal(detected_url), 'position': idx,
+                            'is_external': not self.link_detector.is_internal(detected_url),
                             'detected_method': 'selenium', 'is_javascript': bool(onclick),
                             'is_dynamic': True, 'onclick': onclick
                         })
@@ -1160,91 +1151,27 @@ class WebCrawler:
                     continue
             
             all_links = static_links + js_links + dynamic_links
-            
-            # Process the page content using the helper
-            content_data = self._process_page_content(soup, url, page_id, depth, all_links)
+            content_data, new_pages = self._process_page_content(soup, url, page_id, depth, all_links)
             page_data.update(content_data)
 
-            # Selenium-specific overrides
             page_data['title'] = self.driver.title
             page_data['status_code'] = 200
 
         except Exception as e:
             logger.error(f"Error with Selenium on {url}: {e}")
             page_data['error_message'] = str(e)
-        return page_data
+        return page_data, new_pages
     
-    def crawl_page(self, url: str, page_id: int, depth: int):
-        """Crawl a single page"""
+    def crawl_page(self, url: str, page_id: int, depth: int) -> (Dict, List):
+        """Crawl a single page and return its data and any new internal links found."""
         logger.debug(f"Crawling: {url} (depth: {depth})")
         
-        page_data = self.crawl_page_selenium(url, page_id, depth) if self.use_selenium and self.driver \
+        page_data, new_pages = self.crawl_page_selenium(url, page_id, depth) if self.use_selenium and self.driver \
                     else self.crawl_page_static(url, page_id, depth)
         
-        self.db.update_page_crawl(page_id, page_data)
         time.sleep(self.delay)
-    
-    def start(self):
-        """Start crawling process"""
-        logger.info("Starting crawler...")
+        return page_data, new_pages
 
-        if self.start_url:
-            domain = urlparse(self.start_url).netloc
-            normalized_start_url = self.link_detector.normalize_url_advanced(self.start_url, self.start_url)
-            self.db.add_page(self.start_url, normalized_start_url, depth=0)
-            self.parse_sitemap(domain)
-        
-        self.print_initial_summary()
-        session_crawled_count = 0
-        task_total_initial = self.db.get_uncrawled_pages_count(self.domain_to_crawl)
-
-        if self.domain_to_crawl:
-            logger.info(f"Task: Crawl/update domain '{self.domain_to_crawl}'. Pages to process: {task_total_initial}")
-        else:
-            logger.info(f"Task: Continue crawl. Pages to process: {task_total_initial}")
-        
-        while True:
-            next_page = self.db.get_next_uncrawled(self.domain_to_crawl)
-            if not next_page:
-                if session_crawled_count == 0:
-                    logger.info("No pages to crawl for the selected task.")
-                else:
-                    # Newline after progress bar
-                    print()
-                    logger.info(f"Crawl session complete. Crawled {session_crawled_count} pages.")
-                break
-            
-            page_id, url, depth = next_page
-
-            if not self.disregard_robots:
-                domain = urlparse(url).netloc
-                robot_parser = self.get_robot_parser(domain)
-                if robot_parser and not robot_parser.can_fetch(self.user_agent, url):
-                    logger.warning(f"Skipping (disallowed by robots.txt): {url}")
-                    self.db.update_page_crawl(page_id, {'status_code': 403, 'error_message': 'Disallowed by robots.txt'})
-                    continue
-            
-            if depth > self.max_depth:
-                logger.info(f"Max depth reached, skipping: {url}")
-                continue
-            
-            self.crawl_page(url, page_id, depth)
-            session_crawled_count += 1
-
-            uncrawled_in_task = self.db.get_uncrawled_pages_count(self.domain_to_crawl)
-            total_uncrawled_db = self.db.get_uncrawled_pages_count()
-            progress_percent = (session_crawled_count / task_total_initial) * 100 if task_total_initial > 0 else 100
-
-            # On-the-fly progress reporting to the console
-            print(
-                f"\rProgress: {min(progress_percent, 100):.2f}% | "
-                f"Session: {session_crawled_count} crawled | "
-                f"Task Queue: {uncrawled_in_task} left | "
-                f"DB Queue: {total_uncrawled_db} total left",
-                end="", flush=True
-            )
-        
-        logger.info("Crawler has finished its task.")
     
     def cleanup(self):
         """Cleanup resources"""
@@ -1252,74 +1179,171 @@ class WebCrawler:
             self.driver.quit()
 
 
-def handle_new_scan(args: argparse.Namespace, db_manager: DatabaseManager) -> Optional[WebCrawler]:
-    """Handles the --new-scan mode."""
-    start_url = args.new_scan
-    domain = urlparse(start_url).netloc
-    if db_manager.get_total_pages_count(domain) > 0:
-        choice = input(f"Data for domain '{domain}' already exists. Delete it and start a fresh scan? (y/n): ").lower()
-        if choice == 'y':
-            db_manager.delete_domain_data(domain)
-        else:
-            print("Aborting scan.")
-            return None
+class CrawlerManager:
+    """Orchestrates the asynchronous crawling process."""
+    def __init__(self, db_manager: DatabaseManager, args: argparse.Namespace):
+        self.db = db_manager
+        self.args = args
+        self.queue = asyncio.Queue()
+        self.executor = ThreadPoolExecutor(max_workers=args.workers)
+        self.crawler = None
+        self.domain_to_crawl = None
+        self.in_queue = set()
+        self.in_queue_lock = asyncio.Lock()
+        self.crawled_count = 0
+        self.start_time = None
 
-    return WebCrawler(
-        db_manager=db_manager,
-        start_url=start_url,
-        domain_to_crawl=domain,
-        max_depth=args.max_depth,
-        delay=args.delay,
-        use_selenium=args.use_selenium,
-        disregard_robots=args.disregard_robots
-    )
+    async def worker(self, name: str):
+        """The worker task that processes URLs from the queue."""
+        while True:
+            try:
+                page_id, url, depth = await self.queue.get()
 
-def handle_update(args: argparse.Namespace, db_manager: DatabaseManager) -> Optional[WebCrawler]:
-    """Handles the --update mode."""
-    domains = db_manager.get_distinct_domains()
-    if not domains:
-        print("No domains found in the database to update.")
-        return None
+                # Check robots.txt and max depth
+                if not self.args.disregard_robots:
+                    domain = urlparse(url).netloc
+                    robot_parser = self.crawler.get_robot_parser(domain)
+                    if robot_parser and not robot_parser.can_fetch(self.crawler.user_agent, url):
+                        logger.warning(f"Worker {name} skipping (disallowed by robots.txt): {url}")
+                        self.db.update_page_crawl(page_id, {'status_code': 403, 'error_message': 'Disallowed by robots.txt'})
+                        self.queue.task_done()
+                        continue
 
-    print("Please choose a domain to update:")
-    for i, domain in enumerate(domains):
-        print(f"{i + 1}: {domain}")
+                if depth > self.args.max_depth:
+                    logger.info(f"Worker {name} skipping (max depth reached): {url}")
+                    self.db.update_page_crawl(page_id, {'status_code': 0, 'error_message': 'Max depth reached'})
+                    self.queue.task_done()
+                    continue
 
-    try:
-        choice = int(input("Enter the number of the domain: ")) - 1
-        if 0 <= choice < len(domains):
-            selected_domain = domains[choice]
-            print(f"Resetting and preparing to update domain: {selected_domain}")
-            db_manager.reset_domain_crawl_status(selected_domain)
-            return WebCrawler(
-                db_manager=db_manager,
-                domain_to_crawl=selected_domain,
-                max_depth=args.max_depth,
-                delay=args.delay,
-                use_selenium=args.use_selenium,
-                disregard_robots=args.disregard_robots
+                logger.info(f"Worker {name} processing: {url} (depth: {depth})")
+
+                loop = asyncio.get_running_loop()
+                page_data, new_pages = await loop.run_in_executor(
+                    self.executor, self.crawler.crawl_page, url, page_id, depth
+                )
+
+                self.db.update_page_crawl(page_id, page_data)
+                self.crawled_count += 1
+
+                # Add newly discovered internal pages to the queue
+                for new_url, new_norm_url, parent_url, new_depth in new_pages:
+                    new_page_id = self.db.add_page(new_url, new_norm_url, parent_url=parent_url, depth=new_depth)
+                    if new_page_id:
+                        async with self.in_queue_lock:
+                            if new_page_id not in self.in_queue:
+                                self.in_queue.add(new_page_id)
+                                await self.queue.put((new_page_id, new_url, new_depth))
+
+                self.queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Worker {name} encountered an error on {url}: {e}")
+                if not self.queue.empty():
+                    self.queue.task_done()
+
+    async def run(self):
+        """Sets up and starts the crawling process."""
+        self.start_time = time.time()
+        crawler = await self.setup_crawler()
+        if not crawler:
+            return
+        
+        self.crawler = crawler
+        self.crawler.print_initial_summary()
+
+        # Populate the queue with initial URLs
+        page = self.db.get_next_uncrawled(self.domain_to_crawl)
+        while page:
+            page_id, url, depth = page
+            async with self.in_queue_lock:
+                if page_id not in self.in_queue:
+                    self.in_queue.add(page_id)
+                    await self.queue.put(page)
+            page = self.db.get_next_uncrawled(self.domain_to_crawl)
+
+        initial_pages = self.queue.qsize()
+        if initial_pages == 0:
+            logger.info("No pages to crawl for the selected task.")
+            if self.crawler: self.crawler.cleanup()
+            return
+
+        logger.info(f"Populated queue with {initial_pages} pages for target: {self.domain_to_crawl or 'all domains'}")
+
+        tasks = [asyncio.create_task(self.worker(f'worker-{i+1}')) for i in range(self.args.workers)]
+
+        await self.queue.join()
+
+        for task in tasks:
+            task.cancel()
+
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+        duration = time.time() - self.start_time
+        logger.info(f"Crawl finished. Crawled {self.crawled_count} pages in {duration:.2f} seconds.")
+
+        if self.crawler:
+            self.crawler.cleanup()
+
+    async def setup_crawler(self) -> Optional[WebCrawler]:
+        """Handles the command-line arguments to configure the crawler."""
+        if self.args.new_scan:
+            start_url = self.args.new_scan
+            domain = urlparse(start_url).netloc
+            if self.db.get_total_pages_count(domain) > 0:
+                choice = input(f"Data for domain '{domain}' already exists. Delete it and start a fresh scan? (y/n): ").lower()
+                if choice != 'y':
+                    print("Aborting scan.")
+                    return None
+                self.db.delete_domain_data(domain)
+
+            self.domain_to_crawl = domain
+            crawler = WebCrawler(
+                db_manager=self.db, start_url=start_url, domain_to_crawl=domain,
+                max_depth=self.args.max_depth, delay=self.args.delay,
+                use_selenium=self.args.use_selenium, disregard_robots=self.args.disregard_robots
             )
-        else:
-            print("Invalid choice.")
-            return None
-    except (ValueError, IndexError):
-        print("Invalid input.")
-        return None
+            normalized_start_url = crawler.link_detector.normalize_url_advanced(start_url, start_url)
+            self.db.add_page(start_url, normalized_start_url, depth=0)
+            crawler.parse_sitemap(domain)
+            return crawler
 
-def handle_continue_crawl(args: argparse.Namespace, db_manager: DatabaseManager) -> Optional[WebCrawler]:
-    """Handles the --continue-crawl mode."""
-    if db_manager.get_uncrawled_pages_count() == 0:
-        print("No pages left to crawl in the database.")
-        return None
+        elif self.args.update:
+            domains = self.db.get_distinct_domains()
+            if not domains:
+                print("No domains found in the database to update.")
+                return None
 
-    return WebCrawler(
-        db_manager=db_manager,
-        domain_to_crawl=None,  # Crawl all domains
-        max_depth=args.max_depth,
-        delay=args.delay,
-        use_selenium=args.use_selenium,
-        disregard_robots=args.disregard_robots
-    )
+            print("Please choose a domain to update:")
+            for i, domain in enumerate(domains):
+                print(f"{i + 1}: {domain}")
+
+            try:
+                choice = int(input("Enter the number of the domain: ")) - 1
+                if 0 <= choice < len(domains):
+                    self.domain_to_crawl = domains[choice]
+                    print(f"Resetting and preparing to update domain: {self.domain_to_crawl}")
+                    self.db.reset_domain_crawl_status(self.domain_to_crawl)
+                else:
+                    print("Invalid choice.")
+                    return None
+            except (ValueError, IndexError):
+                print("Invalid input.")
+                return None
+
+        elif self.args.continue_crawl:
+            if self.db.get_uncrawled_pages_count() == 0:
+                print("No pages left to crawl in the database.")
+                return None
+            self.domain_to_crawl = None  # Crawl all domains
+
+        # Default crawler for update/continue
+        return WebCrawler(
+            db_manager=self.db, domain_to_crawl=self.domain_to_crawl,
+            max_depth=self.args.max_depth, delay=self.args.delay,
+            use_selenium=self.args.use_selenium, disregard_robots=self.args.disregard_robots
+        )
+
 
 def main():
     """Main entry point"""
@@ -1335,29 +1359,23 @@ def main():
 
     parser.add_argument("-d", "--max-depth", type=int, default=3, help="Maximum crawl depth. Default: 3")
     parser.add_argument("-w", "--delay", type=float, default=1.0, help="Delay between requests in seconds. Default: 1.0")
-    parser.add_argument("-s", "--use-selenium", action='store_true', help="Use Selenium for dynamic content.")
+    parser.add_argument("--workers", type=int, default=4, help="Number of concurrent crawler workers. Default: 4")
+    parser.add_argument("-s", "--use-selenium", action='store_true', help="Use Selenium for dynamic content (Note: Selenium runs sequentially, not in parallel).")
     parser.add_argument("--disregard-robots", action='store_true', help="Disregard robots.txt rules.")
     
     args = parser.parse_args()
     db_manager = DatabaseManager()
-    crawler = None
+
+    # The new async manager will handle the logic, replacing the old synchronous flow
+    manager = CrawlerManager(db_manager, args)
 
     try:
-        if args.new_scan:
-            crawler = handle_new_scan(args, db_manager)
-        elif args.update:
-            crawler = handle_update(args, db_manager)
-        elif args.continue_crawl:
-            crawler = handle_continue_crawl(args, db_manager)
-
-        if crawler:
-            crawler.start()
-
+        asyncio.run(manager.run())
+    except KeyboardInterrupt:
+        logger.info("Crawler stopped by user.")
     except Exception as e:
-        logger.error(f"An unexpected error occurred: {e}")
+        logger.error(f"An unexpected error occurred in manager: {e}")
     finally:
-        if crawler:
-            crawler.cleanup()
         db_manager.close()
         print("\nOperation finished.")
 

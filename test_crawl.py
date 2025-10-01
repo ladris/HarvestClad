@@ -1,8 +1,12 @@
 import unittest
 import os
 import sqlite3
+import asyncio
+import argparse
+import threading
+from unittest.mock import MagicMock, patch
 from urllib.parse import urlparse
-from crawl import DatabaseManager, ResourceExtractor, LinkDetector, UrlTrapDetector
+from crawl import DatabaseManager, ResourceExtractor, LinkDetector, UrlTrapDetector, WebCrawler, CrawlerManager
 
 class TestLinkDetector(unittest.TestCase):
     def setUp(self):
@@ -110,6 +114,29 @@ class TestDatabaseManager(unittest.TestCase):
 
         # Check that only one page was actually inserted
         count = self.db_manager.get_total_pages_count()
+        self.assertEqual(count, 1)
+
+    def test_add_link_uniqueness(self):
+        # Add a source page
+        page_id = self.db_manager.add_page("http://example.com/source", "http://example.com/source")
+
+        link_data = {
+            'target_url': 'http://example.com/target',
+            'text': 'Target Link'
+        }
+
+        # Add the link for the first time
+        self.db_manager.add_link(page_id, link_data)
+
+        # Try to add the exact same link again
+        self.db_manager.add_link(page_id, link_data)
+
+        # Check that only one link was inserted
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(id) FROM links WHERE source_page_id=?", (page_id,))
+        count = cursor.fetchone()[0]
+        conn.close()
         self.assertEqual(count, 1)
 
     def test_add_resource(self):
@@ -226,6 +253,93 @@ class TestResourceExtractor(unittest.TestCase):
         resources = self.extractor.extract_all_resources(self.soup)
         # 4 images + 1 video + 1 audio + 2 docs + 1 script + 1 style + 1 favicon + 3 embedded = 14
         self.assertEqual(len(resources), 14)
+
+class TestCrawlerManager(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.db_path = "test_manager.db"
+        if os.path.exists(self.db_path):
+            os.remove(self.db_path)
+
+        self.db_manager = DatabaseManager(db_path=self.db_path)
+
+        # Mock command-line arguments
+        self.args = argparse.Namespace(
+            new_scan=None,
+            update=False,
+            continue_crawl=True,
+            max_depth=2,
+            delay=0,
+            workers=1,
+            use_selenium=False,
+            disregard_robots=True
+        )
+
+    def tearDown(self):
+        self.db_manager.close()
+        if os.path.exists(self.db_path):
+            os.remove(self.db_path)
+
+    @patch('crawl.WebCrawler.crawl_page')
+    async def test_worker_handles_links_correctly(self, mock_crawl_page):
+        # Events for two-way synchronization
+        internal_link_queued = asyncio.Event()
+        test_can_continue = asyncio.Event()
+
+        # This side effect simulates the behavior of crawl_page. It's a sync function.
+        def crawl_side_effect(url, page_id, depth):
+            if url == "http://example.com":
+                # Simulate finding one external link (added to DB) and one internal link (returned).
+                self.db_manager.add_page("http://another.com/external", "http://another.com/external", parent_url=None, depth=0)
+                return ({'status_code': 200}, [
+                    ("http://example.com/internal", "http://example.com/internal", "http://example.com", 1)
+                ])
+            return ({'status_code': 200}, [])
+
+        mock_crawl_page.side_effect = crawl_side_effect
+
+        # Setup manager and initial database state
+        start_url = "http://example.com"
+        self.db_manager.add_page(start_url, start_url, depth=0)
+        manager = CrawlerManager(self.db_manager, self.args)
+        manager.crawler = WebCrawler(db_manager=self.db_manager, domain_to_crawl="example.com", max_depth=2)
+        manager.domain_to_crawl = "example.com"
+
+        # Wrap the queue's put method to establish a synchronization point.
+        original_put = manager.queue.put
+        async def put_wrapper(item):
+            await original_put(item)
+            if item[1] == "http://example.com/internal":
+                internal_link_queued.set()  # Signal to the test that the item is queued.
+                await test_can_continue.wait()  # Wait for the test to finish its assertions.
+
+        manager.queue.put = put_wrapper
+
+        # Start the crawl by adding the first page and creating the worker.
+        await manager.queue.put((1, start_url, 0))
+        worker_task = asyncio.create_task(manager.worker("test-worker"))
+
+        # Wait until the worker signals that the internal link is in the queue.
+        await asyncio.wait_for(internal_link_queued.wait(), timeout=2)
+
+        # At this point, the worker is paused inside our put_wrapper, waiting for test_can_continue.
+        # We can now safely assert the state of the system.
+
+        # Assertions
+        self.assertEqual(manager.queue.qsize(), 1, "Internal link should be in the queue")
+
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT url, crawl_depth FROM pages WHERE domain=?", ("another.com",))
+        external_page = cursor.fetchone()
+        conn.close()
+        self.assertIsNotNone(external_page, "External page should be in the database")
+        self.assertEqual(external_page[0], "http://another.com/external")
+        self.assertEqual(external_page[1], 0, "External page should have depth 0")
+
+        # Cleanup: allow the worker to proceed and then cancel it.
+        test_can_continue.set()
+        worker_task.cancel()
+        await asyncio.gather(worker_task, return_exceptions=True)
 
 if __name__ == '__main__':
     unittest.main()
