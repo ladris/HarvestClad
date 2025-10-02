@@ -45,24 +45,26 @@ class TestUrlTrapDetector(unittest.TestCase):
         self.detector = UrlTrapDetector()
 
     def test_is_trap_path_depth(self):
-        # Path depth of 11 should be a trap (default max is 10)
-        deep_url = "http://example.com/" + "/".join([f"segment{i}" for i in range(11)])
+        # Path depth of 21 should be a trap (new default max is 20)
+        deep_url = "http://example.com/" + "/".join([f"segment{i}" for i in range(21)])
         self.assertTrue(self.detector.is_trap(deep_url))
 
-        # Path depth of 10 should not be a trap
-        ok_url = "http://example.com/" + "/".join([f"segment{i}" for i in range(10)])
+        # Path depth of 20 should not be a trap
+        ok_url = "http://example.com/" + "/".join([f"segment{i}" for i in range(20)])
         self.assertFalse(self.detector.is_trap(ok_url))
 
     def test_is_trap_repeating_segments(self):
-        # 4 repeating segments 'a' should be a trap (default max is 3)
-        repeat_url = "http://example.com/a/b/a/c/a/d/a"
+        # 6 repeating segments 'a' should be a trap (new default max is 5)
+        repeat_url = "http://example.com/a/b/a/c/a/d/a/e/a/f/a"
         self.assertTrue(self.detector.is_trap(repeat_url))
 
-        # 3 repeating segments should be fine
-        ok_url = "http://example.com/a/b/a/c/a"
+        # 5 repeating segments should be fine
+        ok_url = "http://example.com/a/b/a/c/a/d/a/e/a"
         self.assertFalse(self.detector.is_trap(ok_url))
 
     def test_is_trap_query_variations(self):
+        # This test uses a custom detector, so it's not affected by the default change,
+        # but it remains a valid test for the logic itself.
         detector = UrlTrapDetector(max_query_variations=3)
         base_path = "http://example.com/page"
 
@@ -116,7 +118,11 @@ class TestDatabaseManager(unittest.TestCase):
         count = self.db_manager.get_total_pages_count()
         self.assertEqual(count, 1)
 
-    def test_add_link_uniqueness(self):
+    def test_add_duplicate_links(self):
+        """
+        Tests that duplicate links (same source and target) can be added
+        since the uniqueness constraint has been removed.
+        """
         # Add a source page
         page_id = self.db_manager.add_page("http://example.com/source", "http://example.com/source")
 
@@ -131,13 +137,13 @@ class TestDatabaseManager(unittest.TestCase):
         # Try to add the exact same link again
         self.db_manager.add_link(page_id, link_data)
 
-        # Check that only one link was inserted
+        # Check that two links were inserted
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(id) FROM links WHERE source_page_id=?", (page_id,))
         count = cursor.fetchone()[0]
         conn.close()
-        self.assertEqual(count, 1)
+        self.assertEqual(count, 2)
 
     def test_add_resource(self):
         url = "http://example.com/resource_page"
@@ -431,6 +437,32 @@ class TestCrawlerManager(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result[1], "noopener nofollow")
         # is_follow should be False (represented as 0 in SQLite) because 'nofollow' is present
         self.assertEqual(result[2], 0)
+
+    @patch('builtins.input', return_value='y')
+    async def test_idle_monitor_shutdown(self, mock_input):
+        """
+        Tests that the idle_monitor correctly identifies an idle state
+        and triggers the shutdown event after user confirmation.
+        """
+        # 1. Setup CrawlerManager with a very short timeout
+        self.args.idle_timeout = 1
+        manager = CrawlerManager(self.db_manager, self.args)
+
+        # 2. Run the idle monitor as a task
+        monitor_task = asyncio.create_task(manager.idle_monitor())
+
+        # 3. Wait for slightly longer than the timeout
+        await asyncio.sleep(1.5)
+
+        # 4. Assert that the shutdown event was set
+        self.assertTrue(manager.shutdown_event.is_set(), "Shutdown event should be set after idle timeout and user confirmation.")
+
+        # 5. Assert that the user was prompted
+        mock_input.assert_called_once_with("Crawler is idle. Exit? (y/n): ")
+
+        # 6. Cleanup
+        monitor_task.cancel()
+        await asyncio.gather(monitor_task, return_exceptions=True)
 
 
 if __name__ == '__main__':

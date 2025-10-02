@@ -126,8 +126,7 @@ class DatabaseManager:
                 surrounding_text TEXT,
                 link_context TEXT,
                 discovered_at TIMESTAMP,
-                FOREIGN KEY (source_page_id) REFERENCES pages(id),
-                UNIQUE(source_page_id, target_url_hash)
+                FOREIGN KEY (source_page_id) REFERENCES pages(id)
             )
         """)
         
@@ -280,32 +279,29 @@ class DatabaseManager:
         cursor = self.connection.cursor()
         target_hash = self.url_hash(link_data['target_url'])
         
-        try:
-            cursor.execute("""
-                INSERT OR IGNORE INTO links 
-                (source_page_id, target_url, target_url_hash, link_text, link_title,
-                 link_type, link_rel, is_internal, is_follow, is_external,
-                 xpath, css_selector, detected_method,
-                 is_javascript, is_dynamic, onclick_handler, href_attribute,
-                 data_attributes, aria_label, surrounding_text, link_context,
-                 discovered_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                source_page_id, link_data['target_url'], target_hash,
-                link_data.get('text'), link_data.get('title'),
-                link_data.get('type'), link_data.get('rel'),
-                link_data.get('is_internal'), link_data.get('is_follow'),
-                link_data.get('is_external'), link_data.get('xpath'),
-                link_data.get('css_selector'),
-                link_data.get('detected_method'), link_data.get('is_javascript'),
-                link_data.get('is_dynamic'), link_data.get('onclick'),
-                link_data.get('href'), link_data.get('data_attributes'),
-                link_data.get('aria_label'), link_data.get('surrounding_text'),
-                link_data.get('context'), datetime.now()
-            ))
-            self.connection.commit()
-        except sqlite3.IntegrityError:
-            pass  # Duplicate link
+        cursor.execute("""
+            INSERT INTO links
+            (source_page_id, target_url, target_url_hash, link_text, link_title,
+             link_type, link_rel, is_internal, is_follow, is_external,
+             xpath, css_selector, detected_method,
+             is_javascript, is_dynamic, onclick_handler, href_attribute,
+             data_attributes, aria_label, surrounding_text, link_context,
+             discovered_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            source_page_id, link_data['target_url'], target_hash,
+            link_data.get('text'), link_data.get('title'),
+            link_data.get('type'), link_data.get('rel'),
+            link_data.get('is_internal'), link_data.get('is_follow'),
+            link_data.get('is_external'), link_data.get('xpath'),
+            link_data.get('css_selector'),
+            link_data.get('detected_method'), link_data.get('is_javascript'),
+            link_data.get('is_dynamic'), link_data.get('onclick'),
+            link_data.get('href'), link_data.get('data_attributes'),
+            link_data.get('aria_label'), link_data.get('surrounding_text'),
+            link_data.get('context'), datetime.now()
+        ))
+        self.connection.commit()
     
     def add_javascript_event(self, page_id: int, event_data: Dict):
         """Add JavaScript event to database"""
@@ -874,7 +870,7 @@ class ResourceExtractor:
 
 class UrlTrapDetector:
     """Detects URL patterns that are likely to be crawler traps."""
-    def __init__(self, max_path_depth=10, max_repeating_segments=3, max_query_variations=5):
+    def __init__(self, max_path_depth=20, max_repeating_segments=5, max_query_variations=10):
         self.max_path_depth = max_path_depth
         self.max_repeating_segments = max_repeating_segments
         self.max_query_variations = max_query_variations
@@ -1220,12 +1216,27 @@ class CrawlerManager:
         self.in_queue_lock = asyncio.Lock()
         self.crawled_count = 0
         self.start_time = None
+        self.shutdown_event = asyncio.Event()
+
+    async def idle_monitor(self):
+        """Monitors the queue and shuts down the crawler if it's idle for too long."""
+        while not self.shutdown_event.is_set():
+            await asyncio.sleep(self.args.idle_timeout)
+            if self.queue.empty():
+                logger.info(f"Queue has been empty for {self.args.idle_timeout} seconds. Shutting down.")
+                # Ask user if they want to exit
+                choice = input("Crawler is idle. Exit? (y/n): ").lower()
+                if choice == 'y':
+                    self.shutdown_event.set()
+                else:
+                    logger.info("Resuming wait.")
+
 
     async def worker(self, name: str):
         """The worker task that processes URLs from the queue."""
-        while True:
+        while not self.shutdown_event.is_set():
             try:
-                page_id, url, depth = await self.queue.get()
+                page_id, url, depth = await asyncio.wait_for(self.queue.get(), timeout=1.0)
 
                 # Check robots.txt and max depth
                 if not self.args.disregard_robots:
@@ -1263,6 +1274,8 @@ class CrawlerManager:
                                 await self.queue.put((new_page_id, new_url, new_depth))
 
                 self.queue.task_done()
+            except asyncio.TimeoutError:
+                continue # Allows the worker to check the shutdown_event
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1296,14 +1309,30 @@ class CrawlerManager:
 
         logger.info(f"Populated queue with {self.queue.qsize()} pages for target: {self.domain_to_crawl or 'all domains'}")
 
-        tasks = [asyncio.create_task(self.worker(f'worker-{i+1}')) for i in range(self.args.workers)]
+        worker_tasks = [asyncio.create_task(self.worker(f'worker-{i+1}')) for i in range(self.args.workers)]
+        monitor_task = asyncio.create_task(self.idle_monitor())
 
-        await self.queue.join()
+        # Wait for either the queue to be fully processed or for the shutdown event
+        queue_join_task = asyncio.create_task(self.queue.join())
+        shutdown_event_task = asyncio.create_task(self.shutdown_event.wait())
 
-        for task in tasks:
+        done, pending = await asyncio.wait(
+            [queue_join_task, shutdown_event_task],
+            return_when=asyncio.FIRST_COMPLETED
+        )
+
+        # Signal shutdown to all tasks
+        self.shutdown_event.set()
+
+        for task in pending:
             task.cancel()
 
-        await asyncio.gather(*tasks, return_exceptions=True)
+        for task in worker_tasks:
+            task.cancel()
+
+        monitor_task.cancel()
+
+        await asyncio.gather(*worker_tasks, monitor_task, *pending, return_exceptions=True)
 
         duration = time.time() - self.start_time
         logger.info(f"Crawl finished. Crawled {self.crawled_count} pages in {duration:.2f} seconds.")
@@ -1409,6 +1438,7 @@ def main():
     parser.add_argument("--workers", type=int, default=4, help="Number of concurrent crawler workers. Default: 4")
     parser.add_argument("-s", "--use-selenium", action='store_true', help="Use Selenium for dynamic content (slower, but handles JS-rendered pages).")
     parser.add_argument("--disregard-robots", action='store_true', help="Disregard robots.txt rules.")
+    parser.add_argument("--idle-timeout", type=int, default=60, help="Seconds to wait for new URLs before exiting. Default: 60")
     
     args = parser.parse_args()
 
