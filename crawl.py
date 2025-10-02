@@ -45,18 +45,101 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class ResourceManager:
+    """Manages thread-local resources like DB connections, sessions, and drivers."""
+    def __init__(self, db_path: str, use_selenium: bool, user_agent: str):
+        self.db_path = db_path
+        self.use_selenium = use_selenium
+        self.user_agent = user_agent
+        self._local = threading.local()
+        # Keep track of all drivers to close them later
+        self._all_drivers: List[webdriver.Chrome] = []
+        self._drivers_lock = threading.Lock()
+
+    def get_db_connection(self) -> sqlite3.Connection:
+        """Returns a thread-local database connection."""
+        if not hasattr(self._local, 'db_conn'):
+            # Each thread gets its own connection. timeout is important for busy dbs.
+            self._local.db_conn = sqlite3.connect(self.db_path, timeout=10)
+        return self._local.db_conn
+
+    def get_session(self) -> requests.Session:
+        """Returns a thread-local requests session."""
+        if not hasattr(self._local, 'session'):
+            session = requests.Session()
+            session.headers.update({'User-Agent': self.user_agent})
+            self._local.session = session
+        return self._local.session
+
+    def get_driver(self) -> Optional[webdriver.Chrome]:
+        """Returns a thread-local Selenium WebDriver instance."""
+        if not self.use_selenium:
+            return None
+        if not hasattr(self._local, 'driver'):
+            try:
+                logger.info(f"Initializing Selenium driver for thread {threading.get_ident()}...")
+                chrome_options = Options()
+                chrome_options.add_argument('--headless')
+                chrome_options.add_argument('--no-sandbox')
+                chrome_options.add_argument('--disable-dev-shm-usage')
+                chrome_options.add_argument('--disable-gpu')
+                chrome_options.add_argument(f'--user-agent={self.user_agent}')
+
+                driver_name = "chromedriver.exe" if platform.system() == "Windows" else "chromedriver"
+                local_driver_path = os.path.abspath(driver_name)
+
+                if os.path.exists(local_driver_path):
+                    service = Service(executable_path=local_driver_path)
+                else:
+                    service = Service(ChromeDriverManager().install())
+
+                driver = webdriver.Chrome(service=service, options=chrome_options)
+                self._local.driver = driver
+                with self._drivers_lock:
+                    self._all_drivers.append(driver)
+                logger.info(f"Selenium driver initialized for thread {threading.get_ident()}.")
+            except Exception as e:
+                logger.error(f"Could not initialize Selenium for thread {threading.get_ident()}: {e}", exc_info=True)
+                self._local.driver = None
+        return self._local.driver
+
+    def cleanup_thread_resources(self):
+        """Cleans up resources for the current thread (db conn and session)."""
+        if hasattr(self._local, 'db_conn'):
+            self._local.db_conn.close()
+            del self._local.db_conn
+        if hasattr(self._local, 'session'):
+            self._local.session.close()
+            del self._local.session
+        # Drivers are cleaned up all at once at the end.
+
+    def cleanup_all_drivers(self):
+        """Quits all Selenium drivers created by this manager."""
+        logger.info(f"Cleaning up {len(self._all_drivers)} Selenium drivers...")
+        with self._drivers_lock:
+            for driver in self._all_drivers:
+                try:
+                    driver.quit()
+                except Exception as e:
+                    logger.error(f"Error quitting a selenium driver: {e}")
+            self._all_drivers.clear()
+
+
 class DatabaseManager:
     """Manages SQLite database operations"""
     
-    def __init__(self, db_path: str = "crawler_data.db"):
-        self.db_path = db_path
-        self.connection = None
-        self.init_database()
-    
+    def __init__(self, resource_manager: 'ResourceManager'):
+        self.resource_manager = resource_manager
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        """Returns the thread-local database connection."""
+        return self.resource_manager.get_db_connection()
+
     def init_database(self):
-        """Initialize database schema"""
-        self.connection = sqlite3.connect(self.db_path, check_same_thread=False)
-        cursor = self.connection.cursor()
+        """Initialize database schema. This should be called once from the main thread."""
+        conn = sqlite3.connect(self.resource_manager.db_path)
+        cursor = conn.cursor()
         
         # Pages table
         cursor.execute("""
@@ -174,8 +257,9 @@ class DatabaseManager:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_target_hash ON links(target_url_hash)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_link_type ON links(link_type)")
         
-        self.connection.commit()
-        logger.info(f"Database initialized: {self.db_path}")
+        conn.commit()
+        conn.close()
+        logger.info(f"Database initialized: {self.resource_manager.db_path}")
     
     def url_hash(self, url: str) -> str:
         """Generate hash for URL"""
@@ -434,9 +518,8 @@ class DatabaseManager:
         logger.info(f"Crawl status reset for domain: {domain}")
     
     def close(self):
-        """Close database connection"""
-        if self.connection:
-            self.connection.close()
+        """Close database connection. Now handled by ResourceManager."""
+        pass
 
 
 class LinkDetector:
@@ -927,129 +1010,73 @@ class UrlTrapDetector:
 
 
 class WebCrawler:
-    """Main crawler class"""
+    """
+    Represents a single crawling task for a specific URL.
+    It is instantiated per-task to ensure thread-safety and correct context.
+    """
 
-    def __init__(self, db_manager: DatabaseManager, start_url: Optional[str] = None,
-                 domain_to_crawl: Optional[str] = None, max_depth: int = 3,
-                 delay: float = 1.0, use_selenium: bool = True, disregard_robots: bool = False):
+    def __init__(self,
+                 resource_manager: 'ResourceManager',
+                 db_manager: DatabaseManager,
+                 base_url: str,
+                 trap_detector: UrlTrapDetector,
+                 robot_parsers: Dict[str, RobotFileParser],
+                 max_depth: int = 3,
+                 delay: float = 1.0,
+                 disregard_robots: bool = False):
+        self.resource_manager = resource_manager
         self.db = db_manager
-        self.start_url = start_url
-        self.domain_to_crawl = domain_to_crawl
+        self.base_url = base_url
         self.max_depth = max_depth
         self.delay = delay
-        self.use_selenium = use_selenium
         self.disregard_robots = disregard_robots
-        
-        if start_url:
-            base_for_detector = start_url
-        elif domain_to_crawl:
-            base_for_detector = f"http://{domain_to_crawl}"
-        else:
-            raise ValueError("WebCrawler requires either a start_url or a domain_to_crawl.")
 
-        self.link_detector = LinkDetector(base_for_detector)
-        self.resource_extractor = ResourceExtractor(base_for_detector)
-        self.trap_detector = UrlTrapDetector()
-        self.user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (AdvancedCrawler/1.0)'
-        self.robot_parsers = {}
-        
-        self.session = requests.Session()
-        self.session.headers.update({'User-Agent': self.user_agent})
-        
-        self.driver = None
-        if use_selenium:
-            self.setup_selenium()
+        # Use shared instances from the CrawlerManager
+        self.trap_detector = trap_detector
+        self.robot_parsers = robot_parsers
 
-    def print_initial_summary(self):
-        """Prints a summary of the current database state."""
-        total_pages = self.db.get_total_pages_count()
-        crawled_pages = self.db.get_crawled_pages_count()
-        uncrawled_pages = self.db.get_uncrawled_pages_count()
-        domains = len(self.db.get_distinct_domains())
+        # Per-task instances
+        self.link_detector = LinkDetector(self.base_url)
+        self.resource_extractor = ResourceExtractor(self.base_url)
+        self.user_agent = self.resource_manager.user_agent
 
-        print("\n--- Database Initial State ---")
-        print(f"Total domains: {domains}")
-        print(f"Total pages discovered: {total_pages}")
-        print(f"Pages crawled: {crawled_pages}")
-        print(f"Pages pending crawl: {uncrawled_pages}")
-        print("------------------------------\n")
+    @property
+    def session(self) -> requests.Session:
+        return self.resource_manager.get_session()
 
-    def parse_sitemap(self, domain: str):
-        """Finds, fetches, and parses the sitemap(s) for a domain."""
-        robot_parser = self.get_robot_parser(domain)
-        sitemap_urls = []
-        if robot_parser and robot_parser.sitemaps:
-            sitemap_urls.extend(robot_parser.sitemaps)
-        else:
-            sitemap_urls.append(urlunparse(('https', domain, '/sitemap.xml', '', '', '')))
+    @property
+    def driver(self) -> Optional[webdriver.Chrome]:
+        return self.resource_manager.get_driver()
 
-        for sitemap_url in sitemap_urls:
-            try:
-                response = self.session.get(sitemap_url, timeout=15)
-                if response.status_code == 200:
-                    logger.info(f"Parsing sitemap: {sitemap_url}")
-                    self.extract_urls_from_sitemap(response.content)
-            except Exception as e:
-                logger.warning(f"Could not fetch or parse sitemap {sitemap_url}: {e}")
-
-    def extract_urls_from_sitemap(self, sitemap_content: bytes):
-        """Extracts URLs from sitemap XML content."""
-        try:
-            root = ET.fromstring(sitemap_content)
-            namespace = {'ns': root.tag.split('}')[0][1:]} if '}' in root.tag else {'ns': ''}
-            urls = [loc.text.strip() for loc in root.findall('.//ns:loc', namespaces=namespace)]
-            for url in urls:
-                if self.link_detector.is_internal(url):
-                    normalized_url = self.link_detector.normalize_url_advanced(url, self.link_detector.base_url)
-                    if normalized_url:
-                        self.db.add_page(url, normalized_url, parent_url='sitemap', depth=0)
-            logger.info(f"Added {len(urls)} URLs from sitemap to the queue.")
-        except ET.ParseError as e:
-            logger.error(f"Failed to parse sitemap XML: {e}")
+    @property
+    def use_selenium(self) -> bool:
+        return self.resource_manager.use_selenium
 
     def get_robot_parser(self, domain: str) -> Optional[RobotFileParser]:
-        """Fetches, parses, and caches the robots.txt file for a domain."""
+        """Fetches, parses, and caches the robots.txt file for a domain using a shared cache."""
         if domain in self.robot_parsers:
             return self.robot_parsers[domain]
+
         robots_url = urlunparse(('https', domain, '/robots.txt', '', '', ''))
         parser = RobotFileParser()
         parser.set_url(robots_url)
         try:
-            parser.read()
-            self.robot_parsers[domain] = parser
-            logger.info(f"Successfully parsed robots.txt for {domain}")
-            return parser
+            # Use the thread-local session to fetch robots.txt
+            response = self.session.get(robots_url, timeout=10)
+            if response.status_code == 200:
+                parser.parse(response.text.splitlines())
+                self.robot_parsers[domain] = parser
+                logger.info(f"Successfully parsed robots.txt for {domain}")
+                return parser
+            else:
+                logger.warning(f"robots.txt for {domain} returned status {response.status_code}")
+                self.robot_parsers[domain] = None # Cache failure
+                return None
         except Exception as e:
             logger.warning(f"Could not fetch or parse robots.txt for {domain}: {e}")
             self.robot_parsers[domain] = None
             return None
-    
-    def setup_selenium(self):
-        """Setup Selenium WebDriver"""
-        try:
-            chrome_options = Options()
-            chrome_options.add_argument('--headless')
-            chrome_options.add_argument('--no-sandbox')
-            chrome_options.add_argument('--disable-dev-shm-usage')
-            chrome_options.add_argument('--disable-gpu')
-            chrome_options.add_argument(f'--user-agent={self.user_agent}')
-            
-            driver_name = "chromedriver.exe" if platform.system() == "Windows" else "chromedriver"
-            local_driver_path = os.path.abspath(driver_name)
 
-            if os.path.exists(local_driver_path):
-                logger.info(f"Using local chromedriver from: {local_driver_path}")
-                service = Service(executable_path=local_driver_path)
-            else:
-                logger.info("Local chromedriver not found, downloading...")
-                service = Service(ChromeDriverManager().install())
-
-            self.driver = webdriver.Chrome(service=service, options=chrome_options)
-            logger.info("Selenium WebDriver initialized")
-        except Exception as e:
-            logger.warning(f"Could not initialize Selenium: {e}")
-            self.use_selenium = False
-    
     def _process_page_content(self, soup: BeautifulSoup, url: str, page_id: int, depth: int, all_links: List[Dict]) -> (Dict, List):
         """
         Extracts metadata from soup, processes links and resources.
@@ -1143,20 +1170,23 @@ class WebCrawler:
         page_data = {}
         new_pages = []
         start_time = time.time()
+        driver = self.driver
+        if not driver:
+            raise Exception("Selenium driver not available for this thread.")
         try:
-            self.driver.get(url)
-            WebDriverWait(self.driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+            driver.get(url)
+            WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
             time.sleep(2)
             
             page_data['response_time_ms'] = int((time.time() - start_time) * 1000)
-            page_source = self.driver.page_source
+            page_source = driver.page_source
             soup = BeautifulSoup(page_source, 'html.parser')
             
             static_links = self.link_detector.extract_static_links(soup, url)
             js_links = self.link_detector.extract_javascript_links(soup, url)
             dynamic_links = []
             
-            clickable_elements = self.driver.find_elements(By.XPATH, "//*[@onclick or @href or contains(@class, 'link') or contains(@class, 'btn')]")
+            clickable_elements = driver.find_elements(By.XPATH, "//*[@onclick or @href or contains(@class, 'link') or contains(@class, 'btn')]")
             for element in clickable_elements[:100]:
                 try:
                     href = element.get_attribute('href')
@@ -1182,75 +1212,105 @@ class WebCrawler:
             content_data, new_pages = self._process_page_content(soup, url, page_id, depth, all_links)
             page_data.update(content_data)
 
-            page_data['title'] = self.driver.title
+            page_data['title'] = driver.title
             page_data['status_code'] = 200
 
         except Exception as e:
-            logger.error(f"Error with Selenium on {url}: {e}")
-            page_data['error_message'] = str(e)
+            # The original error was `error return without exception set`, which is from the driver internals.
+            # By having per-thread drivers, we avoid this. The new exceptions will be more specific.
+            logger.error(f"Error with Selenium on {url}: {e.__class__.__name__}", exc_info=True)
+            page_data['error_message'] = f"Selenium Error: {e}"
         return page_data, new_pages
     
     def crawl_page(self, url: str, page_id: int, depth: int) -> (Dict, List):
         """Crawl a single page and return its data and any new internal links found."""
         logger.debug(f"Crawling: {url} (depth: {depth})")
         
-        page_data, new_pages = self.crawl_page_selenium(url, page_id, depth) if self.use_selenium and self.driver \
+        page_data, new_pages = self.crawl_page_selenium(url, page_id, depth) if self.use_selenium \
                     else self.crawl_page_static(url, page_id, depth)
         
         time.sleep(self.delay)
         return page_data, new_pages
 
-    
-    def cleanup(self):
-        """Cleanup resources"""
-        if self.driver:
-            self.driver.quit()
-
 
 class CrawlerManager:
-    """Orchestrates the asynchronous crawling process."""
-    def __init__(self, db_manager: DatabaseManager, args: argparse.Namespace):
+    """Orchestrates the asynchronous crawling process using thread-safe resources."""
+    def __init__(self, resource_manager: 'ResourceManager', db_manager: DatabaseManager, args: argparse.Namespace):
+        self.resource_manager = resource_manager
         self.db = db_manager
         self.args = args
         self.queue = asyncio.Queue()
         self.executor = ThreadPoolExecutor(max_workers=args.workers)
-        self.crawler = None
         self.domain_to_crawl = None
+        self.base_url_for_crawl = None
         self.in_queue = set()
         self.in_queue_lock = asyncio.Lock()
         self.crawled_count = 0
         self.start_time = None
+        # Shared state for all crawler tasks
+        self.trap_detector = UrlTrapDetector()
+        self.robot_parsers: Dict[str, RobotFileParser] = {}
+
+    def _thread_task(self, page_id: int, url: str, depth: int) -> List:
+        """
+        The actual task executed in a thread. It creates a crawler, processes a single page,
+        and updates the database for that page. Returns a list of new pages found.
+        """
+        page_data = {}
+        new_pages = []
+        try:
+            crawler = WebCrawler(
+                resource_manager=self.resource_manager,
+                db_manager=self.db,
+                base_url=url, # Use current page URL as base for resolving relative links
+                trap_detector=self.trap_detector,
+                robot_parsers=self.robot_parsers,
+                max_depth=self.args.max_depth,
+                delay=self.args.delay,
+                disregard_robots=self.args.disregard_robots
+            )
+
+            # Check robots.txt and max depth
+            if not self.args.disregard_robots:
+                domain = urlparse(url).netloc
+                robot_parser = crawler.get_robot_parser(domain)
+                if robot_parser and not robot_parser.can_fetch(crawler.user_agent, url):
+                    page_data = {'status_code': 403, 'error_message': "Disallowed by robots.txt"}
+                    logger.warning(f"Skipping ({page_data['error_message']}): {url}")
+                    return [] # No new pages
+
+            if depth > self.args.max_depth:
+                page_data = {'status_code': 0, 'error_message': "Max depth reached"}
+                logger.info(f"Skipping ({page_data['error_message']}): {url}")
+                return [] # No new pages
+
+            if not page_data: # If no error so far
+                logger.info(f"Processing: {url} (depth: {depth}, worker: {threading.get_ident()})")
+                page_data, new_pages = crawler.crawl_page(url, page_id, depth)
+
+            return new_pages
+
+        except Exception as e:
+            logger.error(f"Error in thread task for {url}: {e}", exc_info=True)
+            page_data['error_message'] = str(e)
+            return [] # Return empty list on failure
+        finally:
+            # All DB operations for this page must be done before this point.
+            self.db.update_page_crawl(page_id, page_data)
+            self.resource_manager.cleanup_thread_resources()
 
     async def worker(self, name: str):
-        """The worker task that processes URLs from the queue."""
+        """The worker task that pulls from the queue and submits to the thread pool."""
         while True:
             try:
                 page_id, url, depth = await self.queue.get()
 
-                # Check robots.txt and max depth
-                if not self.args.disregard_robots:
-                    domain = urlparse(url).netloc
-                    robot_parser = self.crawler.get_robot_parser(domain)
-                    if robot_parser and not robot_parser.can_fetch(self.crawler.user_agent, url):
-                        logger.warning(f"Worker {name} skipping (disallowed by robots.txt): {url}")
-                        self.db.update_page_crawl(page_id, {'status_code': 403, 'error_message': 'Disallowed by robots.txt'})
-                        self.queue.task_done()
-                        continue
-
-                if depth > self.args.max_depth:
-                    logger.info(f"Worker {name} skipping (max depth reached): {url}")
-                    self.db.update_page_crawl(page_id, {'status_code': 0, 'error_message': 'Max depth reached'})
-                    self.queue.task_done()
-                    continue
-
-                logger.info(f"Worker {name} processing: {url} (depth: {depth})")
-
                 loop = asyncio.get_running_loop()
-                page_data, new_pages = await loop.run_in_executor(
-                    self.executor, self.crawler.crawl_page, url, page_id, depth
+                # The thread task now handles its own DB update and returns only new pages.
+                new_pages = await loop.run_in_executor(
+                    self.executor, self._thread_task, page_id, url, depth
                 )
 
-                self.db.update_page_crawl(page_id, page_data)
                 self.crawled_count += 1
 
                 # Add newly discovered internal pages to the queue
@@ -1266,19 +1326,18 @@ class CrawlerManager:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Worker {name} encountered an error on {url}: {e}")
+                logger.error(f"Async worker {name} failed on {url}: {e}", exc_info=True)
                 if not self.queue.empty():
                     self.queue.task_done()
 
     async def run(self):
         """Sets up and starts the crawling process."""
         self.start_time = time.time()
-        crawler = await self.setup_crawler()
-        if not crawler:
+
+        if not await self.prepare_crawl_session():
             return
         
-        self.crawler = crawler
-        self.crawler.print_initial_summary()
+        self.print_initial_summary()
 
         # Populate the queue with initial URLs
         uncrawled_pages = self.db.get_all_uncrawled(self.domain_to_crawl)
@@ -1291,7 +1350,7 @@ class CrawlerManager:
 
         if not uncrawled_pages:
             logger.info("No pages to crawl for the selected task.")
-            if self.crawler: self.crawler.cleanup()
+            self.resource_manager.cleanup_all_drivers()
             return
 
         logger.info(f"Populated queue with {self.queue.qsize()} pages for target: {self.domain_to_crawl or 'all domains'}")
@@ -1302,93 +1361,136 @@ class CrawlerManager:
 
         for task in tasks:
             task.cancel()
-
         await asyncio.gather(*tasks, return_exceptions=True)
+
+        self.executor.shutdown(wait=True)
+        self.resource_manager.cleanup_all_drivers()
 
         duration = time.time() - self.start_time
         logger.info(f"Crawl finished. Crawled {self.crawled_count} pages in {duration:.2f} seconds.")
 
-        if self.crawler:
-            self.crawler.cleanup()
+    def print_initial_summary(self):
+        """Prints a summary of the current database state."""
+        total = self.db.get_total_pages_count(self.domain_to_crawl)
+        crawled = self.db.get_crawled_pages_count(self.domain_to_crawl)
+        uncrawled = self.db.get_uncrawled_pages_count(self.domain_to_crawl)
+        domains = len(self.db.get_distinct_domains())
 
-    async def setup_crawler(self) -> Optional[WebCrawler]:
-        """Handles the command-line arguments to configure the crawler."""
+        print("\n--- Database Initial State ---")
+        print(f"Total domains in DB: {domains}")
+        print(f"Target domain for this session: {self.domain_to_crawl or 'All'}")
+        print(f"Total pages for target: {total}")
+        print(f"Crawled pages for target: {crawled}")
+        print(f"Uncrawled pages for target: {uncrawled}")
+        print("------------------------------\n")
+
+    def parse_sitemap(self, domain: str):
+        """Finds, fetches, and parses the sitemap(s) for a domain."""
+        # Use a temporary session for this, as it's part of setup
+        session = requests.Session()
+        session.headers.update({'User-Agent': self.resource_manager.user_agent})
+
+        # We need a temporary robot parser instance just for sitemap urls
+        temp_robot_parser = RobotFileParser()
+        temp_robot_parser.set_url(urlunparse(('https', domain, '/robots.txt', '', '', '')))
+        try:
+            temp_robot_parser.read()
+        except Exception:
+            pass # Ignore if robots.txt is unavailable
+
+        sitemap_urls = []
+        if temp_robot_parser.sitemaps:
+            sitemap_urls.extend(temp_robot_parser.sitemaps)
+        else:
+            # Fallback to common location
+            sitemap_urls.append(urlunparse(('https', domain, '/sitemap.xml', '', '', '')))
+
+        link_detector = LinkDetector(self.base_url_for_crawl)
+        for sitemap_url in sitemap_urls:
+            try:
+                response = session.get(sitemap_url, timeout=15)
+                if response.status_code == 200:
+                    logger.info(f"Parsing sitemap: {sitemap_url}")
+                    root = ET.fromstring(response.content)
+                    namespace = {'ns': root.tag.split('}')[0][1:]} if '}' in root.tag else {'ns': ''}
+                    urls = [loc.text.strip() for loc in root.findall('.//ns:loc', namespaces=namespace)]
+                    for url in urls:
+                        if urlparse(url).netloc == domain:
+                            normalized_url = link_detector.normalize_url_advanced(url, url)
+                            if normalized_url:
+                                self.db.add_page(url, normalized_url, parent_url='sitemap', depth=0)
+                    logger.info(f"Added {len(urls)} URLs from sitemap to the queue.")
+            except Exception as e:
+                logger.warning(f"Could not fetch or parse sitemap {sitemap_url}: {e}")
+        session.close()
+
+    async def prepare_crawl_session(self) -> bool:
+        """Handles the command-line arguments to configure the crawl session."""
         if self.args.new_scan:
-            start_url = self.args.new_scan
-            domain = urlparse(start_url).netloc
+            self.base_url_for_crawl = self.args.new_scan
+            domain = urlparse(self.base_url_for_crawl).netloc
             if self.db.get_total_pages_count(domain) > 0:
                 choice = input(f"Data for domain '{domain}' already exists. Delete it and start a fresh scan? (y/n): ").lower()
                 if choice != 'y':
                     print("Aborting scan.")
-                    return None
+                    return False
                 self.db.delete_domain_data(domain)
 
             self.domain_to_crawl = domain
-            crawler = WebCrawler(
-                db_manager=self.db, start_url=start_url, domain_to_crawl=domain,
-                max_depth=self.args.max_depth, delay=self.args.delay,
-                use_selenium=self.args.use_selenium, disregard_robots=self.args.disregard_robots
-            )
-            normalized_start_url = crawler.link_detector.normalize_url_advanced(start_url, start_url)
-            self.db.add_page(start_url, normalized_start_url, depth=0)
-            crawler.parse_sitemap(domain)
-            return crawler
+            link_detector = LinkDetector(self.base_url_for_crawl)
+            normalized_start_url = link_detector.normalize_url_advanced(self.base_url_for_crawl, self.base_url_for_crawl)
+            self.db.add_page(self.base_url_for_crawl, normalized_start_url, depth=0)
+            self.parse_sitemap(domain)
+            return True
 
         elif self.args.update:
             target_domain = self.args.target_domain
-            if target_domain:
-                # Non-interactive: use the specified domain
-                if target_domain not in self.db.get_distinct_domains():
-                    print(f"Error: Domain '{target_domain}' not found in the database. Cannot update.")
-                    return None
-                self.domain_to_crawl = target_domain
-            else:
+            if not target_domain:
                 # Interactive: prompt user to choose from existing domains
                 domains = self.db.get_distinct_domains()
                 if not domains:
                     print("No domains found in the database to update.")
-                    return None
+                    return False
                 print("Please choose a domain to update:")
                 for i, domain in enumerate(domains):
                     print(f"{i + 1}: {domain}")
                 try:
                     choice = int(input("Enter the number of the domain: ")) - 1
                     if 0 <= choice < len(domains):
-                        self.domain_to_crawl = domains[choice]
+                        target_domain = domains[choice]
                     else:
-                        print("Invalid choice.")
-                        return None
+                        print("Invalid choice."); return False
                 except (ValueError, IndexError):
-                    print("Invalid input.")
-                    return None
+                    print("Invalid input."); return False
 
+            if target_domain not in self.db.get_distinct_domains():
+                print(f"Error: Domain '{target_domain}' not found in the database. Cannot update.")
+                return False
+
+            self.domain_to_crawl = target_domain
+            self.base_url_for_crawl = f"http://{self.domain_to_crawl}"
             print(f"Resetting and preparing to update domain: {self.domain_to_crawl}")
             self.db.reset_domain_crawl_status(self.domain_to_crawl)
+            return True
 
         elif self.args.continue_crawl:
             self.domain_to_crawl = self.args.target_domain
             if self.db.get_uncrawled_pages_count(self.domain_to_crawl) == 0:
                 msg = f"for domain '{self.domain_to_crawl}'" if self.domain_to_crawl else "in the database"
                 print(f"No pages left to crawl {msg}.")
-                return None
+                return False
 
-        # Determine the base URL for the crawler instance, which is essential for link/resource tools.
-        base_domain_for_init = self.domain_to_crawl
-        if not base_domain_for_init:
-            # If continuing for all domains, we need a base context. Pick the first one.
-            # This is a limitation of the current design, but it prevents a crash.
-            all_domains = self.db.get_distinct_domains()
-            if not all_domains:
-                print("Cannot initialize crawler: No domains found in database.")
-                return None
-            base_domain_for_init = all_domains[0]
-            logger.warning(f"No specific domain provided for crawl. Using '{base_domain_for_init}' as base context for crawler tools.")
-
-        return WebCrawler(
-            db_manager=self.db, start_url=f"http://{base_domain_for_init}", domain_to_crawl=self.domain_to_crawl,
-            max_depth=self.args.max_depth, delay=self.args.delay,
-            use_selenium=self.args.use_selenium, disregard_robots=self.args.disregard_robots
-        )
+            # Determine the base URL for the crawler instance
+            if self.domain_to_crawl:
+                self.base_url_for_crawl = f"http://{self.domain_to_crawl}"
+            else:
+                all_domains = self.db.get_distinct_domains()
+                if not all_domains:
+                    print("Cannot continue: No domains found in database."); return False
+                self.base_url_for_crawl = f"http://{all_domains[0]}"
+                logger.warning(f"No specific domain provided for continuing. Using '{all_domains[0]}' as base context.")
+            return True
+        return False
 
 
 def main():
@@ -1415,19 +1517,25 @@ def main():
     if args.new_scan and args.target_domain:
         parser.error("--target-domain cannot be used with --new-scan. The domain is derived from the URL.")
 
-    db_manager = DatabaseManager()
+    user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (AdvancedCrawler/1.0)'
 
-    # The new async manager will handle the logic, replacing the old synchronous flow
-    manager = CrawlerManager(db_manager, args)
+    resource_manager = ResourceManager(
+        db_path="crawler_data.db",
+        use_selenium=args.use_selenium,
+        user_agent=user_agent
+    )
+    db_manager = DatabaseManager(resource_manager)
+    db_manager.init_database()
+
+    manager = CrawlerManager(resource_manager, db_manager, args)
 
     try:
         asyncio.run(manager.run())
     except KeyboardInterrupt:
         logger.info("Crawler stopped by user.")
     except Exception as e:
-        logger.error(f"An unexpected error occurred in manager: {e}")
+        logger.error(f"An unexpected error occurred in manager: {e}", exc_info=True)
     finally:
-        db_manager.close()
         print("\nOperation finished.")
 
 
