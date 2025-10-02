@@ -358,9 +358,9 @@ class DatabaseManager:
         """Get all uncrawled pages, optionally for a specific domain."""
         cursor = self.connection.cursor()
         query = """
-            SELECT id, url, crawl_depth
+            SELECT id, url, crawl_depth, normalized_url
             FROM pages
-            WHERE is_crawled = 0
+            WHERE is_crawled = 0 AND normalized_url IS NOT NULL
         """
         params = []
         if domain:
@@ -409,6 +409,12 @@ class DatabaseManager:
             params.append(domain)
         cursor.execute(query, params)
         return cursor.fetchone()[0]
+
+    def get_all_normalized_urls(self) -> Set[str]:
+        """Fetches the set of all unique normalized URLs from the database."""
+        cursor = self.connection.cursor()
+        cursor.execute("SELECT normalized_url FROM pages WHERE normalized_url IS NOT NULL")
+        return {row[0] for row in cursor.fetchall()}
 
     def delete_domain_data(self, domain: str):
         """Deletes all data associated with a specific domain."""
@@ -1212,8 +1218,8 @@ class CrawlerManager:
         self.executor = ThreadPoolExecutor(max_workers=args.workers)
         self.crawler = None
         self.domain_to_crawl = None
-        self.in_queue = set()
-        self.in_queue_lock = asyncio.Lock()
+        self.seen_urls: Set[str] = set()
+        self.seen_urls_lock = threading.Lock()
         self.crawled_count = 0
         self.start_time = None
         self.shutdown_event = asyncio.Event()
@@ -1231,10 +1237,22 @@ class CrawlerManager:
                 else:
                     logger.info("Resuming wait.")
 
+    async def schedule_url_if_new(self, url: str, normalized_url: str, parent_url: str, depth: int):
+        """Atomically checks if a URL has been seen and adds it to the queue if not."""
+        with self.seen_urls_lock:
+            if normalized_url in self.seen_urls:
+                return
+            self.seen_urls.add(normalized_url)
+
+        # The DB operation is thread-safe, and we are now outside the lock.
+        page_id = self.db.add_page(url, normalized_url, parent_url=parent_url, depth=depth)
+        if page_id:
+            await self.queue.put((page_id, url, depth))
 
     async def worker(self, name: str):
         """The worker task that processes URLs from the queue."""
         while not self.shutdown_event.is_set():
+            url = None  # Initialize url to ensure it's available for logging in case of early errors
             try:
                 page_id, url, depth = await asyncio.wait_for(self.queue.get(), timeout=1.0)
 
@@ -1264,14 +1282,9 @@ class CrawlerManager:
                 self.db.update_page_crawl(page_id, page_data)
                 self.crawled_count += 1
 
-                # Add newly discovered internal pages to the queue
+                # Schedule newly discovered internal pages using the new atomic method
                 for new_url, new_norm_url, parent_url, new_depth in new_pages:
-                    new_page_id = self.db.add_page(new_url, new_norm_url, parent_url=parent_url, depth=new_depth)
-                    if new_page_id:
-                        async with self.in_queue_lock:
-                            if new_page_id not in self.in_queue:
-                                self.in_queue.add(new_page_id)
-                                await self.queue.put((new_page_id, new_url, new_depth))
+                    await self.schedule_url_if_new(new_url, new_norm_url, parent_url, new_depth)
 
                 self.queue.task_done()
             except asyncio.TimeoutError:
@@ -1281,7 +1294,10 @@ class CrawlerManager:
             except Exception as e:
                 logger.error(f"Worker {name} encountered an error on {url}: {e}")
                 if not self.queue.empty():
-                    self.queue.task_done()
+                    try:
+                        self.queue.task_done()
+                    except ValueError:
+                        pass # Can happen if task_done is called multiple times
 
     async def run(self):
         """Sets up and starts the crawling process."""
@@ -1293,16 +1309,17 @@ class CrawlerManager:
         self.crawler = crawler
         self.crawler.print_initial_summary()
 
+        # Pre-populate the seen_urls set with all URLs already in the database.
+        logger.info("Populating seen URLs from database...")
+        self.seen_urls = self.db.get_all_normalized_urls()
+        logger.info(f"Found {len(self.seen_urls)} existing URLs.")
+
         # Populate the queue with initial URLs
         uncrawled_pages = self.db.get_all_uncrawled(self.domain_to_crawl)
-        for page in uncrawled_pages:
-            page_id, url, depth = page
-            async with self.in_queue_lock:
-                if page_id not in self.in_queue:
-                    self.in_queue.add(page_id)
-                    await self.queue.put(page)
+        for page_id, url, depth, normalized_url in uncrawled_pages:
+            await self.queue.put((page_id, url, depth))
 
-        if not uncrawled_pages:
+        if self.queue.empty():
             logger.info("No pages to crawl for the selected task.")
             if self.crawler: self.crawler.cleanup()
             return
